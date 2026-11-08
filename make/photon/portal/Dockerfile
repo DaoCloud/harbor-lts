@@ -6,7 +6,9 @@ WORKDIR /build_dir
 
 ARG npm_registry=https://registry.npmjs.org
 
-RUN apt-get update \
+# node:16.10.0 is Debian buster, whose packages moved to archive.debian.org
+RUN sed -i -e 's#deb.debian.org#archive.debian.org#g' -e 's#security.debian.org#archive.debian.org#g' -e '/buster-updates/d' /etc/apt/sources.list \
+    && apt-get update \
     && apt-get install -y --no-install-recommends python-yaml
 
 COPY src/portal/package.json /build_dir

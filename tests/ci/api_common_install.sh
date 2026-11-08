@@ -26,19 +26,24 @@ python --version
 
 ip addr
 docker_config_file="/etc/docker/daemon.json"
-dns_ip_string=$(netplan ip leases eth0 | grep -i dns | awk -F = '{print $2}' | tr " " "\n" | sed 's/,/","/g')
+# Current runners keep netplan config root-only and may have no daemon.json.
+dns_ip_string=$(sudo netplan ip leases eth0 2>/dev/null | grep -i dns | awk -F = '{print $2}' | tr " " "\n" | sed 's/,/","/g')
+if [ -z "$dns_ip_string" ]; then
+    dns_ip_string=$(resolvectl dns eth0 2>/dev/null | awk '{for(i=2;i<=NF;i++) print $i}' | grep -E '^[0-9.]+$' | paste -sd, - | sed 's/,/","/g')
+fi
 dns=[\"${dns_ip_string}\"]
 echo dns=${dns}
 
-cat $docker_config_file
-if [ -f $docker_config_file ];then
-    if [ $(cat /etc/docker/daemon.json |grep \"dns\" |wc -l) -eq 0 ];then
-        sudo sed "s/}/,\n   \"dns\": $dns\n}/" -i $docker_config_file
+if [ -n "$dns_ip_string" ]; then
+    if [ -f $docker_config_file ];then
+        if [ $(cat /etc/docker/daemon.json |grep \"dns\" |wc -l) -eq 0 ];then
+            sudo sed "s/}/,\n   \"dns\": $dns\n}/" -i $docker_config_file
+        fi
+    else
+        echo "{\"dns\": $dns}" | sudo tee $docker_config_file
     fi
-else
-    echo "{\"dns\": $dns}" > $docker_config_file
 fi
-cat $docker_config_file
+cat $docker_config_file || true
 sudo systemctl stop docker
 sudo systemctl start docker
 sleep 2

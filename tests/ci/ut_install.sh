@@ -5,15 +5,12 @@ set -e
 
 sudo apt-get update && sudo apt-get install -y libldap2-dev
 sudo go env -w GO111MODULE=auto
-go get github.com/docker/distribution
-go get github.com/docker/libtrust
-go get golang.org/x/lint/golint
-go get github.com/GeertJohan/fgt
-go get github.com/dghubble/sling
-go get github.com/stretchr/testify
-go get golang.org/x/tools/cmd/cover
-go get github.com/mattn/goveralls
-go get -u github.com/client9/misspell/cmd/misspell
+# Unpinned GOPATH-mode go get now resolves module versions this Go cannot build.
+# The tests build in module mode, so only the tools are installed, at fixed versions.
+go install golang.org/x/lint/golint@v0.0.0-20210508222113-6edffad5e616
+go install github.com/GeertJohan/fgt@v0.0.0-20160120143236-262f7b11eec0
+go install github.com/mattn/goveralls@v0.0.11
+go install github.com/client9/misspell/cmd/misspell@v0.3.4
 # binary will be $(go env GOPATH)/bin/golangci-lint
 # go install/go get installation aren't guaranteed to work. We recommend using binary installation.
 curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin v1.45.2
