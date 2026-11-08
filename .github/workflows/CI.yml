@@ -373,6 +373,37 @@ jobs:
           cd src/github.com/goharbor/harbor
           bash ./tests/showtime.sh ./tests/ci/distro_installer.sh
           df -h
+      - name: save images
+        run: |
+          set -e
+          mkdir -p "$RUNNER_TEMP/images"
+          images=""
+          for name in nginx-photon harbor-portal harbor-core harbor-jobservice registry-photon harbor-registryctl chartmuseum-photon trivy-adapter-photon harbor-exporter; do
+            images="$images goharbor/$name:dev-gitaction"
+          done
+          docker image inspect --format '{{index .RepoTags 0}} {{.Id}} {{.Architecture}}' $images | tee "$RUNNER_TEMP/images/images.txt"
+          docker save $images | gzip -1 > "$RUNNER_TEMP/images/harbor-images-amd64.tar.gz"
+          ls -lh "$RUNNER_TEMP/images"
+      - name: scan images
+        run: |
+          set -e
+          for name in nginx-photon harbor-portal harbor-core harbor-jobservice registry-photon harbor-registryctl chartmuseum-photon trivy-adapter-photon harbor-exporter; do
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$RUNNER_TEMP/images:/out" aquasec/trivy:0.76.2 \
+              image --quiet --scanners vuln --severity CRITICAL,HIGH --format json -o /out/trivy-$name.json goharbor/$name:dev-gitaction
+            python3 -c 'import json,sys
+          d=json.load(open(sys.argv[1]));c=h=0
+          for t in d.get("Results") or []:
+              for v in t.get("Vulnerabilities") or []:
+                  c+=v["Severity"]=="CRITICAL";h+=v["Severity"]=="HIGH"
+          print(sys.argv[2],"critical",c,"high",h)' "$RUNNER_TEMP/images/trivy-$name.json" $name | tee -a "$RUNNER_TEMP/images/scan-summary.txt"
+          done
+      - name: upload images
+        uses: actions/upload-artifact@v4
+        with:
+          name: harbor-images-amd64
+          path: ${{ runner.temp }}/images
+          retention-days: 7
+          compression-level: 0
 
   UI_UT:
     env:
