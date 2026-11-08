@@ -29,7 +29,7 @@ docker_config_file="/etc/docker/daemon.json"
 # Current runners keep netplan config root-only and may have no daemon.json.
 dns_ip_string=$(sudo netplan ip leases eth0 2>/dev/null | grep -i dns | awk -F = '{print $2}' | tr " " "\n" | sed 's/,/","/g')
 if [ -z "$dns_ip_string" ]; then
-    dns_ip_string=$(resolvectl dns eth0 2>/dev/null | awk '{for(i=2;i<=NF;i++) print $i}' | grep -E '^[0-9.]+$' | paste -sd, - | sed 's/,/","/g')
+    dns_ip_string=$(resolvectl dns eth0 2>/dev/null | sed 's/^[^:]*: *//' | tr ' ' '\n' | grep -E '^[0-9.]+$' | paste -sd, - | sed 's/,/","/g')
 fi
 dns=[\"${dns_ip_string}\"]
 echo dns=${dns}
