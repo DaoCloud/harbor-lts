@@ -18,6 +18,9 @@ env:
 on:
   pull_request:
   push:
+    # PR branches run through pull_request only, so each push runs CI once.
+    branches:
+    - dce-v2.6.3
     paths-ignore:
     - 'docs/**'
 
@@ -144,6 +147,25 @@ jobs:
           df -h
           bash ./tests/showtime.sh ./tests/ci/api_run.sh DB $IP
           df -h
+      - name: collect logs
+        if: always()
+        run: |
+          set +e
+          cd src/github.com/goharbor/harbor
+          out="$RUNNER_TEMP/ci-logs"; mkdir -p "$out/containers"
+          sudo docker ps -a > "$out/docker-ps.txt"; cat "$out/docker-ps.txt"
+          for c in $(sudo docker ps -a --format '{{.Names}}'); do sudo docker logs --tail 500 "$c" > "$out/containers/$c.log" 2>&1; done
+          sudo cp -r /var/log/harbor "$out/var-log-harbor" 2>/dev/null
+          cp output.xml log.html "$out/" 2>/dev/null
+          sudo chown -R "$(id -u)" "$out"
+          for f in core jobservice registryctl chartmuseum; do echo "===== $f"; tail -n 30 "$out/var-log-harbor/$f.log" 2>/dev/null; done
+      - name: upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.job }}
+          path: ${{ runner.temp }}/ci-logs
+          retention-days: 7
 
   APITEST_DB_PROXY_CACHE:
     env:
@@ -202,6 +224,25 @@ jobs:
           df -h
           bash ./tests/showtime.sh ./tests/ci/api_run.sh PROXY_CACHE $IP
           df -h
+      - name: collect logs
+        if: always()
+        run: |
+          set +e
+          cd src/github.com/goharbor/harbor
+          out="$RUNNER_TEMP/ci-logs"; mkdir -p "$out/containers"
+          sudo docker ps -a > "$out/docker-ps.txt"; cat "$out/docker-ps.txt"
+          for c in $(sudo docker ps -a --format '{{.Names}}'); do sudo docker logs --tail 500 "$c" > "$out/containers/$c.log" 2>&1; done
+          sudo cp -r /var/log/harbor "$out/var-log-harbor" 2>/dev/null
+          cp output.xml log.html "$out/" 2>/dev/null
+          sudo chown -R "$(id -u)" "$out"
+          for f in core jobservice registryctl chartmuseum; do echo "===== $f"; tail -n 30 "$out/var-log-harbor/$f.log" 2>/dev/null; done
+      - name: upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.job }}
+          path: ${{ runner.temp }}/ci-logs
+          retention-days: 7
 
   APITEST_LDAP:
     env:
@@ -258,6 +299,25 @@ jobs:
           cd src/github.com/goharbor/harbor
           bash ./tests/showtime.sh ./tests/ci/api_run.sh LDAP $IP
           df -h
+      - name: collect logs
+        if: always()
+        run: |
+          set +e
+          cd src/github.com/goharbor/harbor
+          out="$RUNNER_TEMP/ci-logs"; mkdir -p "$out/containers"
+          sudo docker ps -a > "$out/docker-ps.txt"; cat "$out/docker-ps.txt"
+          for c in $(sudo docker ps -a --format '{{.Names}}'); do sudo docker logs --tail 500 "$c" > "$out/containers/$c.log" 2>&1; done
+          sudo cp -r /var/log/harbor "$out/var-log-harbor" 2>/dev/null
+          cp output.xml log.html "$out/" 2>/dev/null
+          sudo chown -R "$(id -u)" "$out"
+          for f in core jobservice registryctl chartmuseum; do echo "===== $f"; tail -n 30 "$out/var-log-harbor/$f.log" 2>/dev/null; done
+      - name: upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.job }}
+          path: ${{ runner.temp }}/ci-logs
+          retention-days: 7
 
   OFFLINE:
     env:
