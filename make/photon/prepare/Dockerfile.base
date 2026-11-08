@@ -1,6 +1,7 @@
 FROM photon:4.0
 
-RUN tdnf install -y python3 python3-pip python3-PyYAML python3-jinja2 && tdnf clean all
+RUN tdnf -y upgrade >> /dev/null \
+    && tdnf install -y python3 python3-pip python3-PyYAML python3-jinja2 && tdnf clean all
 RUN pip3 install pipenv==2022.1.8
 
 #To install only htpasswd binary from photon package httpd

@@ -108,22 +108,22 @@ PKGVERSIONTAG=dev
 PREPARE_VERSION_NAME=versions
 
 #versions
-REGISTRYVERSION=v2.8.0-patch-redis
+REGISTRYVERSION=v2.8.3-patch-redis
 NOTARYVERSION=v0.6.1
 NOTARYMIGRATEVERSION=v4.11.0
-TRIVYVERSION=v0.35.0
+TRIVYVERSION=v0.76.2
 TRIVYADAPTERVERSION=v0.30.6
-# Trivy release archives this old are no longer published, so Trivy is built from source.
-TRIVY_BUILDIMAGE=golang:1.19.13
+# Trivy is built from source with the Go version its go.mod requires.
+TRIVY_BUILDIMAGE=golang:1.27.3
 
 # version of chartmuseum for pulling the source code
-CHARTMUSEUM_SRC_TAG=v0.14.0
+CHARTMUSEUM_SRC_TAG=v0.16.6
 
 # version of chartmuseum
 CHARTMUSEUMVERSION=$(CHARTMUSEUM_SRC_TAG)-redis
 
 # version of registry for pulling the source code
-REGISTRY_SRC_TAG=v2.8.0
+REGISTRY_SRC_TAG=v2.8.3
 
 # dependency binaries
 CHARTURL=https://storage.googleapis.com/harbor-builds/bin/chartmuseum/release-${CHARTMUSEUMVERSION}/chartm
@@ -159,7 +159,7 @@ GOINSTALL=$(GOCMD) install
 GOTEST=$(GOCMD) test
 GODEP=$(GOTEST) -i
 GOFMT=gofmt -w
-GOBUILDIMAGE=golang:1.18.8
+GOBUILDIMAGE=golang:1.27.3
 GOBUILDPATHINCONTAINER=/harbor
 
 # go build

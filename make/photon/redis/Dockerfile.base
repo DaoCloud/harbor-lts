@@ -1,3 +1,4 @@
 FROM photon:4.0
 
-RUN tdnf install -y redis && tdnf clean all
+RUN tdnf -y upgrade >> /dev/null \
+    && tdnf install -y redis && tdnf clean all

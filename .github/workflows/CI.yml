@@ -33,11 +33,11 @@ jobs:
       - ubuntu-24.04
     timeout-minutes: 100
     steps:
-      - name: Set up Go 1.18
+      - name: Set up Go 1.27
         uses: actions/setup-go@v5
         with:
            cache: false
-           go-version: 1.18.8
+           go-version: 1.27.3
         id: go
       - uses: actions/checkout@v4
         with:
@@ -98,11 +98,11 @@ jobs:
       - ubuntu-24.04
     timeout-minutes: 100
     steps:
-      - name: Set up Go 1.18
+      - name: Set up Go 1.27
         uses: actions/setup-go@v5
         with:
           cache: false
-          go-version: 1.18.8
+          go-version: 1.27.3
         id: go
       - uses: actions/checkout@v4
         with:
@@ -175,11 +175,11 @@ jobs:
       - ubuntu-24.04
     timeout-minutes: 100
     steps:
-      - name: Set up Go 1.18
+      - name: Set up Go 1.27
         uses: actions/setup-go@v5
         with:
           cache: false
-          go-version: 1.18.8
+          go-version: 1.27.3
         id: go
       - uses: actions/checkout@v4
         with:
@@ -252,11 +252,11 @@ jobs:
       - ubuntu-24.04
     timeout-minutes: 100
     steps:
-      - name: Set up Go 1.18
+      - name: Set up Go 1.27
         uses: actions/setup-go@v5
         with:
           cache: false
-          go-version: 1.18.8
+          go-version: 1.27.3
         id: go
       - uses: actions/checkout@v4
         with:
@@ -327,11 +327,11 @@ jobs:
       - ubuntu-24.04
     timeout-minutes: 100
     steps:
-      - name: Set up Go 1.18
+      - name: Set up Go 1.27
         uses: actions/setup-go@v5
         with:
           cache: false
-          go-version: 1.18.8
+          go-version: 1.27.3
         id: go
       - uses: actions/checkout@v4
         with:
