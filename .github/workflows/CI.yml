@@ -57,9 +57,10 @@ jobs:
           env
           #sudo apt install -y xvfb
           #xvfb-run ls
-          curl -L https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-`uname -s`-`uname -m` > docker-compose
-          chmod +x docker-compose
-          sudo mv docker-compose /usr/local/bin
+          # docker-compose 1.x speaks Docker API 1.22, which current Docker rejects; use the Compose v2 plugin.
+          printf '#!/bin/sh\nexec docker compose "$@"\n' | sudo tee /usr/local/bin/docker-compose >/dev/null
+          sudo chmod +x /usr/local/bin/docker-compose
+          docker-compose version
           IP=`hostname -I | awk '{print $1}'`
           echo '{"insecure-registries" : ["'$IP':5000"]}' | sudo tee /etc/docker/daemon.json
           echo "IP=$IP" >> $GITHUB_ENV
@@ -125,9 +126,10 @@ jobs:
           df -h
           #sudo apt install -y xvfb
           #xvfb-run ls
-          curl -L https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-`uname -s`-`uname -m` > docker-compose
-          chmod +x docker-compose
-          sudo mv docker-compose /usr/local/bin
+          # docker-compose 1.x speaks Docker API 1.22, which current Docker rejects; use the Compose v2 plugin.
+          printf '#!/bin/sh\nexec docker compose "$@"\n' | sudo tee /usr/local/bin/docker-compose >/dev/null
+          sudo chmod +x /usr/local/bin/docker-compose
+          docker-compose version
       - name: install
         run: |
           cd src/github.com/goharbor/harbor
@@ -182,9 +184,10 @@ jobs:
           df -h
           #sudo apt install -y xvfb
           #xvfb-run ls
-          curl -L https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-`uname -s`-`uname -m` > docker-compose
-          chmod +x docker-compose
-          sudo mv docker-compose /usr/local/bin
+          # docker-compose 1.x speaks Docker API 1.22, which current Docker rejects; use the Compose v2 plugin.
+          printf '#!/bin/sh\nexec docker compose "$@"\n' | sudo tee /usr/local/bin/docker-compose >/dev/null
+          sudo chmod +x /usr/local/bin/docker-compose
+          docker-compose version
       - name: install
         run: |
           cd src/github.com/goharbor/harbor
@@ -238,9 +241,10 @@ jobs:
           df -h
           #sudo apt install -y xvfb
           #xvfb-run ls
-          curl -L https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-`uname -s`-`uname -m` > docker-compose
-          chmod +x docker-compose
-          sudo mv docker-compose /usr/local/bin
+          # docker-compose 1.x speaks Docker API 1.22, which current Docker rejects; use the Compose v2 plugin.
+          printf '#!/bin/sh\nexec docker compose "$@"\n' | sudo tee /usr/local/bin/docker-compose >/dev/null
+          sudo chmod +x /usr/local/bin/docker-compose
+          docker-compose version
       - name: install
         run: |
           cd src/github.com/goharbor/harbor
@@ -292,9 +296,10 @@ jobs:
           df -h
           #sudo apt install -y xvfb
           #xvfb-run ls
-          curl -L https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-`uname -s`-`uname -m` > docker-compose
-          chmod +x docker-compose
-          sudo mv docker-compose /usr/local/bin
+          # docker-compose 1.x speaks Docker API 1.22, which current Docker rejects; use the Compose v2 plugin.
+          printf '#!/bin/sh\nexec docker compose "$@"\n' | sudo tee /usr/local/bin/docker-compose >/dev/null
+          sudo chmod +x /usr/local/bin/docker-compose
+          docker-compose version
           IP=`hostname -I | awk '{print $1}'`
           echo '{"insecure-registries" : ["'$IP':5000"]}' | sudo tee /etc/docker/daemon.json
           echo "IP=$IP" >> $GITHUB_ENV
