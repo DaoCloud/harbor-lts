@@ -6,6 +6,7 @@ env:
    POSTGRESQL_PWD: root123
    POSTGRESQL_DATABASE: registry
    DOCKER_COMPOSE_VERSION: 1.23.0
+   PIP_BREAK_SYSTEM_PACKAGES: 1
    HARBOR_ADMIN: admin
    HARBOR_ADMIN_PASSWD: Harbor12345
    CORE_SECRET: tempString
@@ -26,20 +27,16 @@ jobs:
        UTTEST: true
     runs-on:
       #- self-hosted
-      - ubuntu-latest
+      - ubuntu-24.04
     timeout-minutes: 100
     steps:
       - name: Set up Go 1.18
-        uses: actions/setup-go@v1
+        uses: actions/setup-go@v5
         with:
+           cache: false
            go-version: 1.18.8
         id: go
-      - name: setup Docker
-        uses: docker-practice/actions-setup-docker@0.0.1
-        with:
-          docker_version: 20.04
-          docker_channel: stable
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
          path: src/github.com/goharbor/harbor
       - name: setup env
@@ -54,6 +51,7 @@ jobs:
       - name: before_install
         run: |
           set -x
+          sudo apt-get update -qq && sudo apt-get install -y -qq python-is-python3 python3-pip
           cd src/github.com/goharbor/harbor
           pwd
           env
@@ -82,7 +80,8 @@ jobs:
           bash ./tests/showtime.sh ./tests/ci/ut_run.sh $IP
           df -h
       - name: Codecov For BackEnd
-        uses: codecov/codecov-action@v1
+        uses: codecov/codecov-action@v4
+        continue-on-error: true
         with:
           file: ./src/github.com/goharbor/harbor/profile.cov
           flags: unittests
@@ -92,20 +91,16 @@ jobs:
       APITEST_DB: true
     runs-on:
       #- self-hosted
-      - ubuntu-latest
+      - ubuntu-24.04
     timeout-minutes: 100
     steps:
       - name: Set up Go 1.18
-        uses: actions/setup-go@v1
+        uses: actions/setup-go@v5
         with:
+          cache: false
           go-version: 1.18.8
         id: go
-      - name: setup Docker
-        uses: docker-practice/actions-setup-docker@0.0.1
-        with:
-          docker_version: 18.09
-          docker_channel: stable
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           path: src/github.com/goharbor/harbor
       - name: setup env
@@ -123,6 +118,7 @@ jobs:
       - name: before_install
         run: |
           set -x
+          sudo apt-get update -qq && sudo apt-get install -y -qq python-is-python3 python3-pip
           cd src/github.com/goharbor/harbor
           pwd
           env
@@ -152,20 +148,16 @@ jobs:
       APITEST_DB: true
     runs-on:
       #- self-hosted
-      - ubuntu-latest
+      - ubuntu-24.04
     timeout-minutes: 100
     steps:
       - name: Set up Go 1.18
-        uses: actions/setup-go@v1
+        uses: actions/setup-go@v5
         with:
+          cache: false
           go-version: 1.18.8
         id: go
-      - name: setup Docker
-        uses: docker-practice/actions-setup-docker@0.0.1
-        with:
-          docker_version: 18.09
-          docker_channel: stable
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           path: src/github.com/goharbor/harbor
       - name: setup env
@@ -183,6 +175,7 @@ jobs:
       - name: before_install
         run: |
           set -x
+          sudo apt-get update -qq && sudo apt-get install -y -qq python-is-python3 python3-pip
           cd src/github.com/goharbor/harbor
           pwd
           env
@@ -212,20 +205,16 @@ jobs:
       APITEST_LDAP: true
     runs-on:
       #- self-hosted
-      - ubuntu-latest
+      - ubuntu-24.04
     timeout-minutes: 100
     steps:
       - name: Set up Go 1.18
-        uses: actions/setup-go@v1
+        uses: actions/setup-go@v5
         with:
+          cache: false
           go-version: 1.18.8
         id: go
-      - name: setup Docker
-        uses: docker-practice/actions-setup-docker@0.0.1
-        with:
-          docker_version: 18.09
-          docker_channel: stable
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           path: src/github.com/goharbor/harbor
       - name: setup env
@@ -242,6 +231,7 @@ jobs:
       - name: before_install
         run: |
           set -x
+          sudo apt-get update -qq && sudo apt-get install -y -qq python-is-python3 python3-pip
           cd src/github.com/goharbor/harbor
           pwd
           env
@@ -270,20 +260,16 @@ jobs:
       OFFLINE: true
     runs-on:
       #- self-hosted
-      - ubuntu-latest
+      - ubuntu-24.04
     timeout-minutes: 100
     steps:
       - name: Set up Go 1.18
-        uses: actions/setup-go@v1
+        uses: actions/setup-go@v5
         with:
+          cache: false
           go-version: 1.18.8
         id: go
-      - name: setup Docker
-        uses: docker-practice/actions-setup-docker@0.0.1
-        with:
-          docker_version: 18.09
-          docker_channel: stable
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           path: src/github.com/goharbor/harbor
       - name: setup env
@@ -299,6 +285,7 @@ jobs:
       - name: before_install
         run: |
           set -x
+          sudo apt-get update -qq && sudo apt-get install -y -qq python-is-python3 python3-pip
           cd src/github.com/goharbor/harbor
           pwd
           env
@@ -327,13 +314,13 @@ jobs:
       UI_UT: true
     runs-on:
       #- self-hosted
-      - ubuntu-latest
+      - ubuntu-24.04
     timeout-minutes: 100
     steps:
-      - uses: actions/setup-node@v1
+      - uses: actions/setup-node@v4
         with:
           node-version: '16'
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           path: src/github.com/goharbor/harbor
       - name: script
@@ -344,7 +331,8 @@ jobs:
           bash ./tests/showtime.sh ./tests/ci/ui_ut_run.sh
           df -h
       - name: Codecov For UI
-        uses: codecov/codecov-action@v1
+        uses: codecov/codecov-action@v4
+        continue-on-error: true
         with:
           file:  ./src/github.com/goharbor/harbor/src/portal/coverage/lcov.info
           flags: unittests
