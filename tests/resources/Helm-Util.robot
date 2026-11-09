@@ -19,9 +19,10 @@ Library  Process
 
 *** Keywords ***
 Prepare Helm Plugin
+    # helm-push v0.11 dropped Helm 2 (it reads the Helm 3 repositories file); pin the last release that supports both.
     Wait Unitl Command Success  helm init --stable-repo-url https://charts.helm.sh/stable --client-only
-    Wait Unitl Command Success  helm plugin install https://github.com/chartmuseum/helm-push
-    Wait Unitl Command Success  helm3 plugin install https://github.com/chartmuseum/helm-push
+    Wait Unitl Command Success  helm plugin install https://github.com/chartmuseum/helm-push --version v0.10.4
+    Wait Unitl Command Success  helm3 plugin install https://github.com/chartmuseum/helm-push --version v0.10.4
 
 Helm Repo Add
     [Arguments]  ${harbor_url}  ${user}  ${pwd}  ${project_name}=library  ${helm_repo_name}=myrepo
