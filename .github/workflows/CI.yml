@@ -386,7 +386,7 @@ jobs:
           cd src/github.com/goharbor/harbor
           # Photon 4.0 aarch64 packages stopped updating in 2025, so arm64 images use photon:5.0.
           sudo make compile build GOBUILDTAGS="include_oss include_gcs" VERSIONTAG=dev-gitaction \
-            GOBUILDIMAGE=golang:1.27.3 COMPILETAG=compile_golangimage PHOTON_IMAGE=photon:5.0 \
+            GOBUILDIMAGE=golang:1.27.3 COMPILETAG=compile_golangimage PHOTON_IMAGE=photon:5.0 LINT_APIS=false \
             CHARTFLAG=true TRIVYFLAG=true NOTARYFLAG=false PULL_BASE_FROM_DOCKERHUB=false \
             BUILDTARGET="_build_portal _build_core _build_jobservice _build_registry _build_registryctl _build_chart_server _build_trivy_adapter _build_nginx _compile_and_build_exporter"
           df -h

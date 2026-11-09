@@ -326,9 +326,13 @@ SPECTRAL_VERSION=v6.1.0
 SPECTRAL_IMAGE_BUILD_CMD=${DOCKERBUILD} -f ${TOOLSPATH}/spectral/Dockerfile --build-arg GOLANG=${GOBUILDIMAGE} --build-arg SPECTRAL_VERSION=${SPECTRAL_VERSION} -t ${SPECTRAL_IMAGENAME}:$(SPECTRAL_VERSION) .
 SPECTRAL=$(RUNCONTAINER) $(SPECTRAL_IMAGENAME):$(SPECTRAL_VERSION)
 
+# spectral v6.1.0 has no arm64 binary; arm64 builds pass LINT_APIS=false and rely on the amd64 build to lint.
+LINT_APIS=true
 lint_apis:
+ifneq ($(LINT_APIS),false)
 	$(call prepare_docker_image,${SPECTRAL_IMAGENAME},${SPECTRAL_VERSION},${SPECTRAL_IMAGE_BUILD_CMD})
 	$(SPECTRAL) lint ./api/v2.0/swagger.yaml
+endif
 
 SWAGGER_IMAGENAME=$(IMAGENAMESPACE)/swagger
 SWAGGER_VERSION=v0.25.0
