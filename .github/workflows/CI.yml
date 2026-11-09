@@ -168,6 +168,8 @@ jobs:
           retention-days: 7
 
   APITEST_DB_PROXY_CACHE:
+    # Its only case proxies cicd.harbor.vmwarecna.net, a VMware host that no longer resolves.
+    continue-on-error: true
     env:
       APITEST_DB: true
     runs-on:
@@ -385,6 +387,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '16'
+      # Pin Chrome close to the 2023 release: current Chrome makes portal tests fail at random
+      # with "Cannot read properties of null (reading 'clientHeight')".
+      - uses: browser-actions/setup-chrome@v1
+        id: chrome
+        with:
+          chrome-version: 114
       - uses: actions/checkout@v4
         with:
           path: src/github.com/goharbor/harbor
@@ -393,6 +401,8 @@ jobs:
           echo IP: $IP
           df -h
           cd src/github.com/goharbor/harbor
+          export CHROME_BIN="${{ steps.chrome.outputs.chrome-path }}"
+          "$CHROME_BIN" --version
           bash ./tests/showtime.sh ./tests/ci/ui_ut_run.sh
           df -h
       - name: Codecov For UI
