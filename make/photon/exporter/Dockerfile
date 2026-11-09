@@ -6,7 +6,6 @@ FROM ${build_image} AS build
 
 ENV CGO_ENABLED=0
 ENV GOOS=linux
-ENV GOARCH=amd64
 
 COPY src /harbor/src
 WORKDIR /harbor/src/cmd/exporter

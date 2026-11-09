@@ -296,6 +296,10 @@ jobs:
           cd src/github.com/goharbor/harbor
           bash ./tests/showtime.sh ./tests/ci/distro_installer.sh
           df -h
+      - name: smoke test images
+        run: |
+          cd src/github.com/goharbor/harbor
+          bash ./tests/ci/smoke_images.sh dev-gitaction
       - name: save images
         run: |
           set -e
@@ -324,6 +328,100 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: harbor-images-amd64
+          path: ${{ runner.temp }}/images
+          retention-days: 7
+          compression-level: 0
+
+  OFFLINE_ARM64:
+    env:
+      OFFLINE: true
+    runs-on:
+      #- self-hosted
+      - ubuntu-24.04-arm
+    timeout-minutes: 100
+    steps:
+      - name: Set up Go 1.27
+        uses: actions/setup-go@v5
+        with:
+          cache: false
+          go-version: 1.27.3
+        id: go
+      - uses: actions/checkout@v4
+        with:
+          path: src/github.com/goharbor/harbor
+      - name: setup env
+        run: |
+          cd src/github.com/goharbor/harbor
+          pwd
+          docker version
+          go env
+          echo "GOPATH=$(go env GOPATH):$GITHUB_WORKSPACE" >> $GITHUB_ENV
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+          echo "TOKEN_PRIVATE_KEY_PATH=${GITHUB_WORKSPACE}/src/github.com/goharbor/harbor/tests/private_key.pem" >> $GITHUB_ENV
+        shell: bash
+      - name: before_install
+        run: |
+          set -x
+          sudo apt-get update -qq && sudo apt-get install -y -qq python-is-python3 python3-pip
+          cd src/github.com/goharbor/harbor
+          pwd
+          env
+          df -h
+          #sudo apt install -y xvfb
+          #xvfb-run ls
+          # docker-compose 1.x speaks Docker API 1.22, which current Docker rejects; use the Compose v2 plugin.
+          printf '#!/bin/sh\nexec docker compose "$@"\n' | sudo tee /usr/local/bin/docker-compose >/dev/null
+          sudo chmod +x /usr/local/bin/docker-compose
+          docker-compose version
+          IP=`hostname -I | awk '{print $1}'`
+          echo '{"insecure-registries" : ["'$IP':5000"]}' | sudo tee /etc/docker/daemon.json
+          echo "IP=$IP" >> $GITHUB_ENV
+          sudo cp ./tests/harbor_ca.crt /usr/local/share/ca-certificates/
+          sudo update-ca-certificates
+          sudo service docker restart
+      - name: script
+        run: |
+          echo IP: $IP
+          df -h
+          cd src/github.com/goharbor/harbor
+          # Photon 4.0 aarch64 packages stopped updating in 2025, so arm64 images use photon:5.0.
+          sudo make compile build GOBUILDTAGS="include_oss include_gcs" VERSIONTAG=dev-gitaction \
+            GOBUILDIMAGE=golang:1.27.3 COMPILETAG=compile_golangimage PHOTON_IMAGE=photon:5.0 \
+            CHARTFLAG=true TRIVYFLAG=true NOTARYFLAG=false PULL_BASE_FROM_DOCKERHUB=false \
+            BUILDTARGET="_build_portal _build_core _build_jobservice _build_registry _build_registryctl _build_chart_server _build_trivy_adapter _build_nginx _compile_and_build_exporter"
+          df -h
+      - name: smoke test images
+        run: |
+          cd src/github.com/goharbor/harbor
+          bash ./tests/ci/smoke_images.sh dev-gitaction
+      - name: save images
+        run: |
+          set -e
+          mkdir -p "$RUNNER_TEMP/images"
+          images=""
+          for name in nginx-photon harbor-portal harbor-core harbor-jobservice registry-photon harbor-registryctl chartmuseum-photon trivy-adapter-photon harbor-exporter; do
+            images="$images goharbor/$name:dev-gitaction"
+          done
+          docker image inspect --format '{{index .RepoTags 0}} {{.Id}} {{.Architecture}}' $images | tee "$RUNNER_TEMP/images/images.txt"
+          docker save $images | gzip -1 > "$RUNNER_TEMP/images/harbor-images-arm64.tar.gz"
+          ls -lh "$RUNNER_TEMP/images"
+      - name: scan images
+        run: |
+          set -e
+          for name in nginx-photon harbor-portal harbor-core harbor-jobservice registry-photon harbor-registryctl chartmuseum-photon trivy-adapter-photon harbor-exporter; do
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$RUNNER_TEMP/images:/out" aquasec/trivy:0.76.2 \
+              image --quiet --scanners vuln --severity CRITICAL,HIGH --format json -o /out/trivy-$name.json goharbor/$name:dev-gitaction
+            python3 -c 'import json,sys
+          d=json.load(open(sys.argv[1]));c=h=0
+          for t in d.get("Results") or []:
+              for v in t.get("Vulnerabilities") or []:
+                  c+=v["Severity"]=="CRITICAL";h+=v["Severity"]=="HIGH"
+          print(sys.argv[2],"critical",c,"high",h)' "$RUNNER_TEMP/images/trivy-$name.json" $name | tee -a "$RUNNER_TEMP/images/scan-summary.txt"
+          done
+      - name: upload images
+        uses: actions/upload-artifact@v4
+        with:
+          name: harbor-images-arm64
           path: ${{ runner.temp }}/images
           retention-days: 7
           compression-level: 0
