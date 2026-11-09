@@ -8,6 +8,9 @@ sudo gsutil version -l
 harbor_logs_bucket="harbor-ci-logs"
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Test charts used to come from a GCS bucket that no longer exists.
+bash $DIR/serve_test_charts.sh $2
 E2E_IMAGE="goharbor/harbor-e2e-engine:4.2.1-api"
 
 # GS util
@@ -22,8 +25,6 @@ docker ps
 # run db auth api cases
 if [ "$1" = 'DB' ]; then
     docker run -i --privileged -v $DIR/../../:/drone -v $DIR/../:/ca -v /var/log/harbor/:/var/log/harbor/ -w /drone $E2E_IMAGE robot --exclude proxy_cache -v DOCKER_USER:${DOCKER_USER} -v DOCKER_PWD:${DOCKER_PWD} -v ip:$2  -v ip1: -v http_get_ca:false -v HARBOR_PASSWORD:Harbor12345 /drone/tests/robot-cases/Group1-Nightly/Setup.robot /drone/tests/robot-cases/Group0-BAT/API_DB.robot
-elif [ "$1" = 'PROXY_CACHE' ]; then
-    docker run -i --privileged -v $DIR/../../:/drone -v $DIR/../:/ca -w /drone $E2E_IMAGE robot --include setup  --include proxy_cache -v DOCKER_USER:${DOCKER_USER} -v DOCKER_PWD:${DOCKER_PWD} -v ip:$2  -v ip1: -v http_get_ca:false -v HARBOR_PASSWORD:Harbor12345 /drone/tests/robot-cases/Group1-Nightly/Setup.robot /drone/tests/robot-cases/Group0-BAT/API_DB.robot
 elif [ "$1" = 'LDAP' ]; then
     # run ldap api cases
     python $DIR/../../tests/configharbor.py -H $IP -u $HARBOR_ADMIN -p $HARBOR_ADMIN_PASSWD -c auth_mode=ldap_auth \

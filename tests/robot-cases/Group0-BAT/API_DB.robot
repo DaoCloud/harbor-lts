@@ -16,6 +16,9 @@ ${SERVER_API_ENDPOINT}  ${SERVER_URL}/api
 &{SERVER_CONFIG}  endpoint=${SERVER_API_ENDPOINT}  verify_ssl=False
 
 *** Test Cases ***
+# Removed in this fork because their dependencies are gone from CI:
+# Sign A Image (Notary is not built), Replication From Dockerhub (needs Docker Hub
+# credentials), Proxy Cache (needs cicd.harbor.vmwarecna.net, which no longer resolves).
 
 Test Case - Garbage Collection
     [Tags]  gc
@@ -64,10 +67,6 @@ Test Case - Copy Artifact Outside Project
 Test Case - Robot Account
     [Tags]  robot_account
     Harbor API Test  ./tests/apitests/python/test_robot_account.py
-
-Test Case - Sign A Image
-    [Tags]  sign_image
-    Harbor API Test  ./tests/apitests/python/test_sign_image.py
 
 Test Case - Project Quota
     [Tags]  quota
@@ -144,14 +143,6 @@ Test Case - Push Artifact With ORAS CLI
 Test Case - Push Chart File To Chart Repository By Helm V2 With Robot Account
     [Tags]  helm2
     Harbor API Test  ./tests/apitests/python/test_push_chart_by_helm2_helm3_with_robot_Account.py
-
-Test Case - Replication From Dockerhub
-    [Tags]  replic_dockerhub
-    Harbor API Test  ./tests/apitests/python/test_replication_from_dockerhub.py
-
-Test Case - Proxy Cache
-    [Tags]  proxy_cache
-    Harbor API Test  ./tests/apitests/python/test_proxy_cache.py
 
 Test Case - Tag Immutability
     [Tags]  tag_immutability
