@@ -2,7 +2,7 @@
 Make Swagger Client
     ${rc}  ${output}=  Run And Return Rc And Output  pip uninstall setuptools -y
     LogAll  ${output}
-    ${rc}  ${output}=  Run And Return Rc And Output  pip install -U pip setuptools
+    ${rc}  ${output}=  Run And Return Rc And Output  pip install pip==23.3.2 setuptools==57.4.0
     LogAll  ${output}
     ${rc}  ${output}=  Run And Return Rc And Output  make swagger_client
     LogAll  ${output}
