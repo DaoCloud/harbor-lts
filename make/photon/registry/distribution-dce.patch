@@ -3318,3 +3318,43 @@ index 51f8cb3..9feb0a9 100644
  	return aead.Open(nil, parts.iv, append(parts.ciphertext, parts.tag...), aad)
  }
  
+
+diff --git a/registry/storage/purgeuploads.go b/registry/storage/purgeuploads.go
+index cac9212..5299fa1 100644
+--- a/registry/storage/purgeuploads.go
++++ b/registry/storage/purgeuploads.go
+@@ -70,7 +70,7 @@ func getOutstandingUploads(ctx context.Context, driver storageDriver.StorageDriv
+ 	err = driver.Walk(ctx, root, func(fileInfo storageDriver.FileInfo) error {
+ 		filePath := fileInfo.Path()
+ 		_, file := path.Split(filePath)
+-		if file[0] == '_' {
++		if len(file) > 0 && file[0] == '_' {
+ 			// Reserved directory
+ 			inUploadDir = (file == "_uploads")
+ 
+diff --git a/registry/storage/purgeuploads_test.go b/registry/storage/purgeuploads_test.go
+index 398df2b..b618b50 100644
+--- a/registry/storage/purgeuploads_test.go
++++ b/registry/storage/purgeuploads_test.go
+@@ -53,6 +53,21 @@ func TestPurgeGather(t *testing.T) {
+ 	}
+ }
+ 
++type emptyBasenameDriver struct {
++	driver.StorageDriver
++}
++
++func (d emptyBasenameDriver) Walk(ctx context.Context, root string, walkFn driver.WalkFn) error {
++	return walkFn(driver.FileInfoInternal{FileInfoFields: driver.FileInfoFields{Path: root + "/", IsDir: true}})
++}
++
++func TestPurgeUploadsHandlesEmptyBasename(t *testing.T) {
++	fs := emptyBasenameDriver{StorageDriver: inmemory.New()}
++	if _, errs := getOutstandingUploads(context.Background(), fs); len(errs) != 0 {
++		t.Fatalf("unexpected errors: %v", errs)
++	}
++}
++
+ func TestPurgeNone(t *testing.T) {
+ 	fs, ctx := testUploadFS(t, 10, "test-repo", time.Now())
+ 	oneHourAgo := time.Now().Add(-1 * time.Hour)
