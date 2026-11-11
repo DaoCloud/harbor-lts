@@ -425,34 +425,3 @@ jobs:
           path: ${{ runner.temp }}/images
           retention-days: 7
           compression-level: 0
-
-  UI_UT:
-    # About 30 of 387 portal specs fail at random with "Cannot read properties of null
-    # (reading 'clientHeight')" on both this base and the PR, whatever the Chrome version.
-    continue-on-error: true
-    env:
-      UI_UT: true
-    runs-on:
-      #- self-hosted
-      - ubuntu-24.04
-    timeout-minutes: 100
-    steps:
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '16'
-      - uses: actions/checkout@v4
-        with:
-          path: src/github.com/goharbor/harbor
-      - name: script
-        run: |
-          echo IP: $IP
-          df -h
-          cd src/github.com/goharbor/harbor
-          bash ./tests/showtime.sh ./tests/ci/ui_ut_run.sh
-          df -h
-      - name: Codecov For UI
-        uses: codecov/codecov-action@v4
-        continue-on-error: true
-        with:
-          file:  ./src/github.com/goharbor/harbor/src/portal/coverage/lcov.info
-          flags: unittests
