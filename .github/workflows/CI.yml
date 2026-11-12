@@ -20,7 +20,7 @@ on:
   push:
     # PR branches run through pull_request only, so each push runs CI once.
     branches:
-    - dce-v2.6.3
+    - release-*
     paths-ignore:
     - 'docs/**'
 
