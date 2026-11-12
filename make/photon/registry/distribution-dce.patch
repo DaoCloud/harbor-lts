@@ -1,0 +1,3360 @@
+diff --git a/configuration/configuration.go b/configuration/configuration.go
+index 7076df8..3e74330 100644
+--- a/configuration/configuration.go
++++ b/configuration/configuration.go
+@@ -168,6 +168,9 @@ type Configuration struct {
+ 		// Addr specifies the the redis instance available to the application.
+ 		Addr string `yaml:"addr,omitempty"`
+ 
++		// SentinelMasterSet specifies the the redis sentinel master set name.
++		SentinelMasterSet string `yaml:"sentinelMasterSet,omitempty"`
++
+ 		// Password string to use when making a connection.
+ 		Password string `yaml:"password,omitempty"`
+ 
+diff --git a/registry/handlers/app.go b/registry/handlers/app.go
+index bf56cea..ad45bf3 100644
+--- a/registry/handlers/app.go
++++ b/registry/handlers/app.go
+@@ -3,6 +3,7 @@ package handlers
+ import (
+ 	"context"
+ 	"crypto/rand"
++	"errors"
+ 	"expvar"
+ 	"fmt"
+ 	"math"
+@@ -17,6 +18,8 @@ import (
+ 	"time"
+ 
+ 	"github.com/distribution/reference"
++	"github.com/FZambia/sentinel"
++
+ 	"github.com/docker/distribution"
+ 	"github.com/docker/distribution/configuration"
+ 	dcontext "github.com/docker/distribution/context"
+@@ -499,6 +502,44 @@ func (app *App) configureRedis(configuration *configuration.Configuration) {
+ 		return
+ 	}
+ 
++	var getRedisAddr func() (string, error)
++	var testOnBorrow func(c redis.Conn, t time.Time) error
++	if configuration.Redis.SentinelMasterSet != "" {
++		sntnl := &sentinel.Sentinel{
++			Addrs:      strings.Split(configuration.Redis.Addr, ","),
++			MasterName: configuration.Redis.SentinelMasterSet,
++			Dial: func(addr string) (redis.Conn, error) {
++				c, err := redis.DialTimeout("tcp", addr,
++					configuration.Redis.DialTimeout,
++					configuration.Redis.ReadTimeout,
++					configuration.Redis.WriteTimeout)
++				if err != nil {
++					return nil, err
++				}
++				return c, nil
++			},
++		}
++		getRedisAddr = func() (string, error) {
++			return sntnl.MasterAddr()
++		}
++		testOnBorrow = func(c redis.Conn, t time.Time) error {
++			if !sentinel.TestRole(c, "master") {
++				return errors.New("role check failed")
++			}
++			return nil
++		}
++
++	} else {
++		getRedisAddr = func() (string, error) {
++			return configuration.Redis.Addr, nil
++		}
++		testOnBorrow = func(c redis.Conn, t time.Time) error {
++			// TODO(stevvooe): We can probably do something more interesting
++			// here with the health package.
++			_, err := c.Do("PING")
++			return err
++		}
++	}
+ 	pool := &redis.Pool{
+ 		Dial: func() (redis.Conn, error) {
+ 			// TODO(stevvooe): Yet another use case for contextual timing.
+@@ -514,8 +555,11 @@ func (app *App) configureRedis(configuration *configuration.Configuration) {
+ 				}
+ 			}
+ 
+-			conn, err := redis.DialTimeout("tcp",
+-				configuration.Redis.Addr,
++			redisAddr, err := getRedisAddr()
++			if err != nil {
++				return nil, err
++			}
++			conn, err := redis.DialTimeout("tcp", redisAddr,
+ 				configuration.Redis.DialTimeout,
+ 				configuration.Redis.ReadTimeout,
+ 				configuration.Redis.WriteTimeout)
+@@ -547,16 +591,11 @@ func (app *App) configureRedis(configuration *configuration.Configuration) {
+ 			done(nil)
+ 			return conn, nil
+ 		},
+-		MaxIdle:     configuration.Redis.Pool.MaxIdle,
+-		MaxActive:   configuration.Redis.Pool.MaxActive,
+-		IdleTimeout: configuration.Redis.Pool.IdleTimeout,
+-		TestOnBorrow: func(c redis.Conn, t time.Time) error {
+-			// TODO(stevvooe): We can probably do something more interesting
+-			// here with the health package.
+-			_, err := c.Do("PING")
+-			return err
+-		},
+-		Wait: false, // if a connection is not available, proceed without cache.
++		MaxIdle:      configuration.Redis.Pool.MaxIdle,
++		MaxActive:    configuration.Redis.Pool.MaxActive,
++		IdleTimeout:  configuration.Redis.Pool.IdleTimeout,
++		TestOnBorrow: testOnBorrow,
++		Wait:         false, // if a connection is not available, proceed without cache.
+ 	}
+ 
+ 	app.redis = pool
+diff --git a/registry/handlers/app_test.go b/registry/handlers/app_test.go
+index 60a57e6..8a644d8 100644
+--- a/registry/handlers/app_test.go
++++ b/registry/handlers/app_test.go
+@@ -140,7 +140,29 @@ func TestAppDispatcher(t *testing.T) {
+ // TestNewApp covers the creation of an application via NewApp with a
+ // configuration.
+ func TestNewApp(t *testing.T) {
+-	ctx := context.Background()
++
++	config := configuration.Configuration{
++		Storage: configuration.Storage{
++			"testdriver": nil,
++			"maintenance": configuration.Parameters{"uploadpurging": map[interface{}]interface{}{
++				"enabled": false,
++			}},
++		},
++		Auth: configuration.Auth{
++			// For now, we simply test that new auth results in a viable
++			// application.
++			"silly": {
++				"realm":   "realm-test",
++				"service": "service-test",
++			},
++		},
++	}
++	runAppWithConfig(t, config)
++}
++
++// TestNewApp covers the creation of an application via NewApp with a
++// configuration(with redis).
++func TestNewAppWithRedis(t *testing.T) {
+ 	config := configuration.Configuration{
+ 		Storage: configuration.Storage{
+ 			"testdriver": nil,
+@@ -157,7 +179,38 @@ func TestNewApp(t *testing.T) {
+ 			},
+ 		},
+ 	}
++	config.Redis.Addr = "127.0.0.1:6379"
++	config.Redis.DB = 0
++	runAppWithConfig(t, config)
++}
+ 
++// TestNewApp covers the creation of an application via NewApp with a
++// configuration(with redis sentinel cluster).
++func TestNewAppWithRedisSentinelCluster(t *testing.T) {
++	config := configuration.Configuration{
++		Storage: configuration.Storage{
++			"testdriver": nil,
++			"maintenance": configuration.Parameters{"uploadpurging": map[interface{}]interface{}{
++				"enabled": false,
++			}},
++		},
++		Auth: configuration.Auth{
++			// For now, we simply test that new auth results in a viable
++			// application.
++			"silly": {
++				"realm":   "realm-test",
++				"service": "service-test",
++			},
++		},
++	}
++	config.Redis.Addr = "192.168.0.11:26379,192.168.0.12:26379"
++	config.Redis.DB = 0
++	config.Redis.SentinelMasterSet = "mymaster"
++	runAppWithConfig(t, config)
++}
++
++func runAppWithConfig(t *testing.T, config configuration.Configuration) {
++	ctx := context.Background()
+ 	// Mostly, with this test, given a sane configuration, we are simply
+ 	// ensuring that NewApp doesn't panic. We might want to tweak this
+ 	// behavior.
+diff --git a/vendor.conf b/vendor.conf
+index 2081842..f203f11 100644
+--- a/vendor.conf
++++ b/vendor.conf
+@@ -15,7 +15,7 @@ github.com/docker/libtrust fa567046d9b14f6aa788882a950d69651d230b21
+ github.com/garyburd/redigo 535138d7bcd717d6531c701ef5933d98b1866257
+ github.com/go-ini/ini 2ba15ac2dc9cdf88c110ec2dc0ced7fa45f5678c
+ github.com/golang/protobuf 8d92cf5fc15a4382f8964b08e1f42a75c0591aa3
+-github.com/gorilla/handlers 60c7bfde3e33c201519a200a4507a158cc03a17b
++github.com/gorilla/handlers v1.3.0
+ github.com/gorilla/mux 599cba5e7b6137d46ddf58fb1765f5d928e69604
+ github.com/inconshreveable/mousetrap 76626ae9c91c4f2a10f34cad8ce83ea42c93bb75
+ github.com/jmespath/go-jmespath bd40a432e4c76585ef6b72d3fd96fb9b6dc7b68d
+@@ -45,7 +45,7 @@ google.golang.org/appengine 12d5545dc1cfa6047a286d5e853841b6471f4c19
+ google.golang.org/cloud 975617b05ea8a58727e6c1a06b6161ff4185a9f2
+ google.golang.org/grpc d3ddb4469d5a1b949fc7a7da7c1d6a0d1b6de994
+ gopkg.in/check.v1 64131543e7896d5bcc6bd5a76287eb75ea96c673
+-gopkg.in/square/go-jose.v1 40d457b439244b546f023d056628e5184136899b
++gopkg.in/square/go-jose.v1 v1.1.2
+ gopkg.in/yaml.v2 v2.2.1
+ rsc.io/letsencrypt e770c10b0f1a64775ae91d240407ce00d1a5bdeb https://github.com/dmcgowan/letsencrypt.git
+ github.com/opencontainers/go-digest ea51bea511f75cfa3ef6098cc253c5c3609b037a # v1.0.0
+diff --git a/vendor/github.com/FZambia/sentinel/LICENSE b/vendor/github.com/FZambia/sentinel/LICENSE
+new file mode 100644
+index 0000000..9c8f3ea
+--- /dev/null
++++ b/vendor/github.com/FZambia/sentinel/LICENSE
+@@ -0,0 +1,201 @@
++                                 Apache License
++                           Version 2.0, January 2004
++                        http://www.apache.org/licenses/
++
++   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
++
++   1. Definitions.
++
++      "License" shall mean the terms and conditions for use, reproduction,
++      and distribution as defined by Sections 1 through 9 of this document.
++
++      "Licensor" shall mean the copyright owner or entity authorized by
++      the copyright owner that is granting the License.
++
++      "Legal Entity" shall mean the union of the acting entity and all
++      other entities that control, are controlled by, or are under common
++      control with that entity. For the purposes of this definition,
++      "control" means (i) the power, direct or indirect, to cause the
++      direction or management of such entity, whether by contract or
++      otherwise, or (ii) ownership of fifty percent (50%) or more of the
++      outstanding shares, or (iii) beneficial ownership of such entity.
++
++      "You" (or "Your") shall mean an individual or Legal Entity
++      exercising permissions granted by this License.
++
++      "Source" form shall mean the preferred form for making modifications,
++      including but not limited to software source code, documentation
++      source, and configuration files.
++
++      "Object" form shall mean any form resulting from mechanical
++      transformation or translation of a Source form, including but
++      not limited to compiled object code, generated documentation,
++      and conversions to other media types.
++
++      "Work" shall mean the work of authorship, whether in Source or
++      Object form, made available under the License, as indicated by a
++      copyright notice that is included in or attached to the work
++      (an example is provided in the Appendix below).
++
++      "Derivative Works" shall mean any work, whether in Source or Object
++      form, that is based on (or derived from) the Work and for which the
++      editorial revisions, annotations, elaborations, or other modifications
++      represent, as a whole, an original work of authorship. For the purposes
++      of this License, Derivative Works shall not include works that remain
++      separable from, or merely link (or bind by name) to the interfaces of,
++      the Work and Derivative Works thereof.
++
++      "Contribution" shall mean any work of authorship, including
++      the original version of the Work and any modifications or additions
++      to that Work or Derivative Works thereof, that is intentionally
++      submitted to Licensor for inclusion in the Work by the copyright owner
++      or by an individual or Legal Entity authorized to submit on behalf of
++      the copyright owner. For the purposes of this definition, "submitted"
++      means any form of electronic, verbal, or written communication sent
++      to the Licensor or its representatives, including but not limited to
++      communication on electronic mailing lists, source code control systems,
++      and issue tracking systems that are managed by, or on behalf of, the
++      Licensor for the purpose of discussing and improving the Work, but
++      excluding communication that is conspicuously marked or otherwise
++      designated in writing by the copyright owner as "Not a Contribution."
++
++      "Contributor" shall mean Licensor and any individual or Legal Entity
++      on behalf of whom a Contribution has been received by Licensor and
++      subsequently incorporated within the Work.
++
++   2. Grant of Copyright License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      copyright license to reproduce, prepare Derivative Works of,
++      publicly display, publicly perform, sublicense, and distribute the
++      Work and such Derivative Works in Source or Object form.
++
++   3. Grant of Patent License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      (except as stated in this section) patent license to make, have made,
++      use, offer to sell, sell, import, and otherwise transfer the Work,
++      where such license applies only to those patent claims licensable
++      by such Contributor that are necessarily infringed by their
++      Contribution(s) alone or by combination of their Contribution(s)
++      with the Work to which such Contribution(s) was submitted. If You
++      institute patent litigation against any entity (including a
++      cross-claim or counterclaim in a lawsuit) alleging that the Work
++      or a Contribution incorporated within the Work constitutes direct
++      or contributory patent infringement, then any patent licenses
++      granted to You under this License for that Work shall terminate
++      as of the date such litigation is filed.
++
++   4. Redistribution. You may reproduce and distribute copies of the
++      Work or Derivative Works thereof in any medium, with or without
++      modifications, and in Source or Object form, provided that You
++      meet the following conditions:
++
++      (a) You must give any other recipients of the Work or
++          Derivative Works a copy of this License; and
++
++      (b) You must cause any modified files to carry prominent notices
++          stating that You changed the files; and
++
++      (c) You must retain, in the Source form of any Derivative Works
++          that You distribute, all copyright, patent, trademark, and
++          attribution notices from the Source form of the Work,
++          excluding those notices that do not pertain to any part of
++          the Derivative Works; and
++
++      (d) If the Work includes a "NOTICE" text file as part of its
++          distribution, then any Derivative Works that You distribute must
++          include a readable copy of the attribution notices contained
++          within such NOTICE file, excluding those notices that do not
++          pertain to any part of the Derivative Works, in at least one
++          of the following places: within a NOTICE text file distributed
++          as part of the Derivative Works; within the Source form or
++          documentation, if provided along with the Derivative Works; or,
++          within a display generated by the Derivative Works, if and
++          wherever such third-party notices normally appear. The contents
++          of the NOTICE file are for informational purposes only and
++          do not modify the License. You may add Your own attribution
++          notices within Derivative Works that You distribute, alongside
++          or as an addendum to the NOTICE text from the Work, provided
++          that such additional attribution notices cannot be construed
++          as modifying the License.
++
++      You may add Your own copyright statement to Your modifications and
++      may provide additional or different license terms and conditions
++      for use, reproduction, or distribution of Your modifications, or
++      for any such Derivative Works as a whole, provided Your use,
++      reproduction, and distribution of the Work otherwise complies with
++      the conditions stated in this License.
++
++   5. Submission of Contributions. Unless You explicitly state otherwise,
++      any Contribution intentionally submitted for inclusion in the Work
++      by You to the Licensor shall be under the terms and conditions of
++      this License, without any additional terms or conditions.
++      Notwithstanding the above, nothing herein shall supersede or modify
++      the terms of any separate license agreement you may have executed
++      with Licensor regarding such Contributions.
++
++   6. Trademarks. This License does not grant permission to use the trade
++      names, trademarks, service marks, or product names of the Licensor,
++      except as required for reasonable and customary use in describing the
++      origin of the Work and reproducing the content of the NOTICE file.
++
++   7. Disclaimer of Warranty. Unless required by applicable law or
++      agreed to in writing, Licensor provides the Work (and each
++      Contributor provides its Contributions) on an "AS IS" BASIS,
++      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++      implied, including, without limitation, any warranties or conditions
++      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
++      PARTICULAR PURPOSE. You are solely responsible for determining the
++      appropriateness of using or redistributing the Work and assume any
++      risks associated with Your exercise of permissions under this License.
++
++   8. Limitation of Liability. In no event and under no legal theory,
++      whether in tort (including negligence), contract, or otherwise,
++      unless required by applicable law (such as deliberate and grossly
++      negligent acts) or agreed to in writing, shall any Contributor be
++      liable to You for damages, including any direct, indirect, special,
++      incidental, or consequential damages of any character arising as a
++      result of this License or out of the use or inability to use the
++      Work (including but not limited to damages for loss of goodwill,
++      work stoppage, computer failure or malfunction, or any and all
++      other commercial damages or losses), even if such Contributor
++      has been advised of the possibility of such damages.
++
++   9. Accepting Warranty or Additional Liability. While redistributing
++      the Work or Derivative Works thereof, You may choose to offer,
++      and charge a fee for, acceptance of support, warranty, indemnity,
++      or other liability obligations and/or rights consistent with this
++      License. However, in accepting such obligations, You may act only
++      on Your own behalf and on Your sole responsibility, not on behalf
++      of any other Contributor, and only if You agree to indemnify,
++      defend, and hold each Contributor harmless for any liability
++      incurred by, or claims asserted against, such Contributor by reason
++      of your accepting any such warranty or additional liability.
++
++   END OF TERMS AND CONDITIONS
++
++   APPENDIX: How to apply the Apache License to your work.
++
++      To apply the Apache License to your work, attach the following
++      boilerplate notice, with the fields enclosed by brackets "{}"
++      replaced with your own identifying information. (Don't include
++      the brackets!)  The text should be enclosed in the appropriate
++      comment syntax for the file format. We also recommend that a
++      file or class name and description of purpose be included on the
++      same "printed page" as the copyright notice for easier
++      identification within third-party archives.
++
++   Copyright {yyyy} {name of copyright owner}
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
+\ No newline at end of file
+diff --git a/vendor/github.com/FZambia/sentinel/README.md b/vendor/github.com/FZambia/sentinel/README.md
+new file mode 100644
+index 0000000..fc81043
+--- /dev/null
++++ b/vendor/github.com/FZambia/sentinel/README.md
+@@ -0,0 +1,39 @@
++go-sentinel
++===========
++
++Redis Sentinel support for [redigo](https://github.com/gomodule/redigo) library.
++
++Documentation
++-------------
++
++- [API Reference](http://godoc.org/github.com/FZambia/sentinel)
++
++Alternative solution
++--------------------
++
++You can alternatively configure Haproxy between your application and Redis to proxy requests to Redis master instance if you only need HA:
++
++```
++listen redis
++    server redis-01 127.0.0.1:6380 check port 6380 check inter 2s weight 1 inter 2s downinter 5s rise 10 fall 2
++    server redis-02 127.0.0.1:6381 check port 6381 check inter 2s weight 1 inter 2s downinter 5s rise 10 fall 2 backup
++    bind *:6379
++    mode tcp
++    option tcpka
++    option tcplog
++    option tcp-check
++    tcp-check send PING\r\n
++    tcp-check expect string +PONG
++    tcp-check send info\ replication\r\n
++    tcp-check expect string role:master
++    tcp-check send QUIT\r\n
++    tcp-check expect string +OK
++    balance roundrobin
++```
++
++This way you don't need to use this library.
++
++License
++-------
++
++Library is available under the [Apache License, Version 2.0](http://www.apache.org/licenses/LICENSE-2.0.html).
+\ No newline at end of file
+diff --git a/vendor/github.com/FZambia/sentinel/sentinel.go b/vendor/github.com/FZambia/sentinel/sentinel.go
+new file mode 100644
+index 0000000..79209e9
+--- /dev/null
++++ b/vendor/github.com/FZambia/sentinel/sentinel.go
+@@ -0,0 +1,426 @@
++package sentinel
++
++import (
++	"errors"
++	"fmt"
++	"net"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/garyburd/redigo/redis"
++)
++
++// Sentinel provides a way to add high availability (HA) to Redis Pool using
++// preconfigured addresses of Sentinel servers and name of master which Sentinels
++// monitor. It works with Redis >= 2.8.12 (mostly because of ROLE command that
++// was introduced in that version, it's possible though to support old versions
++// using INFO command).
++//
++// Example of the simplest usage to contact master "mymaster":
++//
++//  func newSentinelPool() *redis.Pool {
++//  	sntnl := &sentinel.Sentinel{
++//  		Addrs:      []string{":26379", ":26380", ":26381"},
++//  		MasterName: "mymaster",
++//  		Dial: func(addr string) (redis.Conn, error) {
++//  			timeout := 500 * time.Millisecond
++//  			c, err := redis.DialTimeout("tcp", addr, timeout, timeout, timeout)
++//  			if err != nil {
++//  				return nil, err
++//  			}
++//  			return c, nil
++//  		},
++//  	}
++//  	return &redis.Pool{
++//  		MaxIdle:     3,
++//  		MaxActive:   64,
++//  		Wait:        true,
++//  		IdleTimeout: 240 * time.Second,
++//  		Dial: func() (redis.Conn, error) {
++//  			masterAddr, err := sntnl.MasterAddr()
++//  			if err != nil {
++//  				return nil, err
++//  			}
++//  			c, err := redis.Dial("tcp", masterAddr)
++//  			if err != nil {
++//  				return nil, err
++//  			}
++//  			return c, nil
++//  		},
++//  		TestOnBorrow: func(c redis.Conn, t time.Time) error {
++//  			if !sentinel.TestRole(c, "master") {
++//  				return errors.New("Role check failed")
++//  			} else {
++//  				return nil
++//  			}
++//  		},
++//  	}
++//  }
++type Sentinel struct {
++	// Addrs is a slice with known Sentinel addresses.
++	Addrs []string
++
++	// MasterName is a name of Redis master Sentinel servers monitor.
++	MasterName string
++
++	// Dial is a user supplied function to connect to Sentinel on given address. This
++	// address will be chosen from Addrs slice.
++	// Note that as per the redis-sentinel client guidelines, a timeout is mandatory
++	// while connecting to Sentinels, and should not be set to 0.
++	Dial func(addr string) (redis.Conn, error)
++
++	// Pool is a user supplied function returning custom connection pool to Sentinel.
++	// This can be useful to tune options if you are not satisfied with what default
++	// Sentinel pool offers. See defaultPool() method for default pool implementation.
++	// In most cases you only need to provide Dial function and let this be nil.
++	Pool func(addr string) *redis.Pool
++
++	mu    sync.RWMutex
++	pools map[string]*redis.Pool
++	addr  string
++}
++
++// NoSentinelsAvailable is returned when all sentinels in the list are exhausted
++// (or none configured), and contains the last error returned by Dial (which
++// may be nil)
++type NoSentinelsAvailable struct {
++	lastError error
++}
++
++func (ns NoSentinelsAvailable) Error() string {
++	if ns.lastError != nil {
++		return fmt.Sprintf("redigo: no sentinels available; last error: %s", ns.lastError.Error())
++	}
++	return fmt.Sprintf("redigo: no sentinels available")
++}
++
++// putToTop puts Sentinel address to the top of address list - this means
++// that all next requests will use Sentinel on this address first.
++//
++// From Sentinel guidelines:
++//
++// The first Sentinel replying to the client request should be put at the
++// start of the list, so that at the next reconnection, we'll try first
++// the Sentinel that was reachable in the previous connection attempt,
++// minimizing latency.
++//
++// Lock must be held by caller.
++func (s *Sentinel) putToTop(addr string) {
++	addrs := s.Addrs
++	if addrs[0] == addr {
++		// Already on top.
++		return
++	}
++	newAddrs := []string{addr}
++	for _, a := range addrs {
++		if a == addr {
++			continue
++		}
++		newAddrs = append(newAddrs, a)
++	}
++	s.Addrs = newAddrs
++}
++
++// putToBottom puts Sentinel address to the bottom of address list.
++// We call this method internally when see that some Sentinel failed to answer
++// on application request so next time we start with another one.
++//
++// Lock must be held by caller.
++func (s *Sentinel) putToBottom(addr string) {
++	addrs := s.Addrs
++	if addrs[len(addrs)-1] == addr {
++		// Already on bottom.
++		return
++	}
++	newAddrs := []string{}
++	for _, a := range addrs {
++		if a == addr {
++			continue
++		}
++		newAddrs = append(newAddrs, a)
++	}
++	newAddrs = append(newAddrs, addr)
++	s.Addrs = newAddrs
++}
++
++// defaultPool returns a connection pool to one Sentinel. This allows
++// us to call concurrent requests to Sentinel using connection Do method.
++func (s *Sentinel) defaultPool(addr string) *redis.Pool {
++	return &redis.Pool{
++		MaxIdle:     3,
++		MaxActive:   10,
++		Wait:        true,
++		IdleTimeout: 240 * time.Second,
++		Dial: func() (redis.Conn, error) {
++			return s.Dial(addr)
++		},
++		TestOnBorrow: func(c redis.Conn, t time.Time) error {
++			_, err := c.Do("PING")
++			return err
++		},
++	}
++}
++
++func (s *Sentinel) get(addr string) redis.Conn {
++	pool := s.poolForAddr(addr)
++	return pool.Get()
++}
++
++func (s *Sentinel) poolForAddr(addr string) *redis.Pool {
++	s.mu.Lock()
++	if s.pools == nil {
++		s.pools = make(map[string]*redis.Pool)
++	}
++	pool, ok := s.pools[addr]
++	if ok {
++		s.mu.Unlock()
++		return pool
++	}
++	s.mu.Unlock()
++	newPool := s.newPool(addr)
++	s.mu.Lock()
++	p, ok := s.pools[addr]
++	if ok {
++		s.mu.Unlock()
++		return p
++	}
++	s.pools[addr] = newPool
++	s.mu.Unlock()
++	return newPool
++}
++
++func (s *Sentinel) newPool(addr string) *redis.Pool {
++	if s.Pool != nil {
++		return s.Pool(addr)
++	}
++	return s.defaultPool(addr)
++}
++
++// close connection pool to Sentinel.
++// Lock must be hold by caller.
++func (s *Sentinel) close() {
++	if s.pools != nil {
++		for _, pool := range s.pools {
++			pool.Close()
++		}
++	}
++	s.pools = nil
++}
++
++func (s *Sentinel) doUntilSuccess(f func(redis.Conn) (interface{}, error)) (interface{}, error) {
++	s.mu.RLock()
++	addrs := s.Addrs
++	s.mu.RUnlock()
++
++	var lastErr error
++
++	for _, addr := range addrs {
++		conn := s.get(addr)
++		reply, err := f(conn)
++		conn.Close()
++		if err != nil {
++			lastErr = err
++			s.mu.Lock()
++			pool, ok := s.pools[addr]
++			if ok {
++				pool.Close()
++				delete(s.pools, addr)
++			}
++			s.putToBottom(addr)
++			s.mu.Unlock()
++			continue
++		}
++		s.putToTop(addr)
++		return reply, nil
++	}
++
++	return nil, NoSentinelsAvailable{lastError: lastErr}
++}
++
++// MasterAddr returns an address of current Redis master instance.
++func (s *Sentinel) MasterAddr() (string, error) {
++	res, err := s.doUntilSuccess(func(c redis.Conn) (interface{}, error) {
++		return queryForMaster(c, s.MasterName)
++	})
++	if err != nil {
++		return "", err
++	}
++	return res.(string), nil
++}
++
++// SlaveAddrs returns a slice with known slave addresses of current master instance.
++func (s *Sentinel) SlaveAddrs() ([]string, error) {
++	res, err := s.doUntilSuccess(func(c redis.Conn) (interface{}, error) {
++		return queryForSlaveAddrs(c, s.MasterName)
++	})
++	if err != nil {
++		return nil, err
++	}
++	return res.([]string), nil
++}
++
++// Slave represents a Redis slave instance which is known by Sentinel.
++type Slave struct {
++	ip    string
++	port  string
++	flags string
++}
++
++// Addr returns an address of slave.
++func (s *Slave) Addr() string {
++	return net.JoinHostPort(s.ip, s.port)
++}
++
++// Available returns if slave is in working state at moment based on information in slave flags.
++func (s *Slave) Available() bool {
++	return !strings.Contains(s.flags, "disconnected") && !strings.Contains(s.flags, "s_down")
++}
++
++// Slaves returns a slice with known slaves of master instance.
++func (s *Sentinel) Slaves() ([]*Slave, error) {
++	res, err := s.doUntilSuccess(func(c redis.Conn) (interface{}, error) {
++		return queryForSlaves(c, s.MasterName)
++	})
++	if err != nil {
++		return nil, err
++	}
++	return res.([]*Slave), nil
++}
++
++// SentinelAddrs returns a slice of known Sentinel addresses Sentinel server aware of.
++func (s *Sentinel) SentinelAddrs() ([]string, error) {
++	res, err := s.doUntilSuccess(func(c redis.Conn) (interface{}, error) {
++		return queryForSentinels(c, s.MasterName)
++	})
++	if err != nil {
++		return nil, err
++	}
++	return res.([]string), nil
++}
++
++// Discover allows to update list of known Sentinel addresses. From docs:
++//
++// A client may update its internal list of Sentinel nodes following this procedure:
++// 1) Obtain a list of other Sentinels for this master using the command SENTINEL sentinels <master-name>.
++// 2) Add every ip:port pair not already existing in our list at the end of the list.
++func (s *Sentinel) Discover() error {
++	addrs, err := s.SentinelAddrs()
++	if err != nil {
++		return err
++	}
++	s.mu.Lock()
++	for _, addr := range addrs {
++		if !stringInSlice(addr, s.Addrs) {
++			s.Addrs = append(s.Addrs, addr)
++		}
++	}
++	s.mu.Unlock()
++	return nil
++}
++
++// Close closes current connection to Sentinel.
++func (s *Sentinel) Close() error {
++	s.mu.Lock()
++	s.close()
++	s.mu.Unlock()
++	return nil
++}
++
++// TestRole wraps GetRole in a test to verify if the role matches an expected
++// role string. If there was any error in querying the supplied connection,
++// the function returns false. Works with Redis >= 2.8.12.
++// It's not goroutine safe, but if you call this method on pooled connections
++// then you are OK.
++func TestRole(c redis.Conn, expectedRole string) bool {
++	role, err := getRole(c)
++	if err != nil || role != expectedRole {
++		return false
++	}
++	return true
++}
++
++// getRole is a convenience function supplied to query an instance (master or
++// slave) for its role. It attempts to use the ROLE command introduced in
++// redis 2.8.12.
++func getRole(c redis.Conn) (string, error) {
++	res, err := c.Do("ROLE")
++	if err != nil {
++		return "", err
++	}
++	rres, ok := res.([]interface{})
++	if ok {
++		return redis.String(rres[0], nil)
++	}
++	return "", errors.New("redigo: can not transform ROLE reply to string")
++}
++
++func queryForMaster(conn redis.Conn, masterName string) (string, error) {
++	res, err := redis.Strings(conn.Do("SENTINEL", "get-master-addr-by-name", masterName))
++	if err != nil {
++		return "", err
++	}
++	if len(res) < 2 {
++		return "", errors.New("redigo: malformed get-master-addr-by-name reply")
++	}
++	masterAddr := net.JoinHostPort(res[0], res[1])
++	return masterAddr, nil
++}
++
++func queryForSlaveAddrs(conn redis.Conn, masterName string) ([]string, error) {
++	slaves, err := queryForSlaves(conn, masterName)
++	if err != nil {
++		return nil, err
++	}
++	slaveAddrs := make([]string, 0)
++	for _, slave := range slaves {
++		slaveAddrs = append(slaveAddrs, slave.Addr())
++	}
++	return slaveAddrs, nil
++}
++
++func queryForSlaves(conn redis.Conn, masterName string) ([]*Slave, error) {
++	res, err := redis.Values(conn.Do("SENTINEL", "slaves", masterName))
++	if err != nil {
++		return nil, err
++	}
++	slaves := make([]*Slave, 0)
++	for _, a := range res {
++		sm, err := redis.StringMap(a, err)
++		if err != nil {
++			return slaves, err
++		}
++		slave := &Slave{
++			ip:    sm["ip"],
++			port:  sm["port"],
++			flags: sm["flags"],
++		}
++		slaves = append(slaves, slave)
++	}
++	return slaves, nil
++}
++
++func queryForSentinels(conn redis.Conn, masterName string) ([]string, error) {
++	res, err := redis.Values(conn.Do("SENTINEL", "sentinels", masterName))
++	if err != nil {
++		return nil, err
++	}
++	sentinels := make([]string, 0)
++	for _, a := range res {
++		sm, err := redis.StringMap(a, err)
++		if err != nil {
++			return sentinels, err
++		}
++		sentinels = append(sentinels, fmt.Sprintf("%s:%s", sm["ip"], sm["port"]))
++	}
++	return sentinels, nil
++}
++
++func stringInSlice(str string, slice []string) bool {
++	for _, s := range slice {
++		if s == str {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/vendor/github.com/gorilla/handlers/.travis.yml b/vendor/github.com/gorilla/handlers/.travis.yml
+new file mode 100644
+index 0000000..1ba74af
+--- /dev/null
++++ b/vendor/github.com/gorilla/handlers/.travis.yml
+@@ -0,0 +1,20 @@
++language: go
++sudo: false
++
++matrix:
++  include:
++    - go: 1.4
++    - go: 1.5
++    - go: 1.6
++    - go: 1.7
++    - go: 1.8
++    - go: tip
++  allow_failures:
++    - go: tip
++
++script:
++  - go get -t -v ./...
++  - diff -u <(echo -n) <(gofmt -d .)
++  - go vet $(go list ./... | grep -v /vendor/)
++  - go test -v -race ./...
++  
+diff --git a/vendor/github.com/gorilla/handlers/README.md b/vendor/github.com/gorilla/handlers/README.md
+index a340abe..4a6895d 100644
+--- a/vendor/github.com/gorilla/handlers/README.md
++++ b/vendor/github.com/gorilla/handlers/README.md
+@@ -1,25 +1,28 @@
+ gorilla/handlers
+ ================
+ [![GoDoc](https://godoc.org/github.com/gorilla/handlers?status.svg)](https://godoc.org/github.com/gorilla/handlers) [![Build Status](https://travis-ci.org/gorilla/handlers.svg?branch=master)](https://travis-ci.org/gorilla/handlers)
++[![Sourcegraph](https://sourcegraph.com/github.com/gorilla/handlers/-/badge.svg)](https://sourcegraph.com/github.com/gorilla/handlers?badge)
++
+ 
+ Package handlers is a collection of handlers (aka "HTTP middleware") for use
+ with Go's `net/http` package (or any framework supporting `http.Handler`), including:
+ 
+-* `LoggingHandler` for logging HTTP requests in the Apache [Common Log
++* [**LoggingHandler**](https://godoc.org/github.com/gorilla/handlers#LoggingHandler) for logging HTTP requests in the Apache [Common Log
+   Format](http://httpd.apache.org/docs/2.2/logs.html#common).
+-* `CombinedLoggingHandler` for logging HTTP requests in the Apache [Combined Log
++* [**CombinedLoggingHandler**](https://godoc.org/github.com/gorilla/handlers#CombinedLoggingHandler) for logging HTTP requests in the Apache [Combined Log
+   Format](http://httpd.apache.org/docs/2.2/logs.html#combined) commonly used by
+   both Apache and nginx.
+-* `CompressHandler` for gzipping responses.
+-* `ContentTypeHandler` for validating requests against a list of accepted
++* [**CompressHandler**](https://godoc.org/github.com/gorilla/handlers#CompressHandler) for gzipping responses.
++* [**ContentTypeHandler**](https://godoc.org/github.com/gorilla/handlers#ContentTypeHandler) for validating requests against a list of accepted
+   content types.
+-* `MethodHandler` for matching HTTP methods against handlers in a
++* [**MethodHandler**](https://godoc.org/github.com/gorilla/handlers#MethodHandler) for matching HTTP methods against handlers in a
+   `map[string]http.Handler`
+-* `ProxyHeaders` for populating `r.RemoteAddr` and `r.URL.Scheme` based on the
++* [**ProxyHeaders**](https://godoc.org/github.com/gorilla/handlers#ProxyHeaders) for populating `r.RemoteAddr` and `r.URL.Scheme` based on the
+   `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Proto` and RFC7239 `Forwarded`
+   headers when running a Go server behind a HTTP reverse proxy.
+-* `CanonicalHost` for re-directing to the preferred host when handling multiple 
++* [**CanonicalHost**](https://godoc.org/github.com/gorilla/handlers#CanonicalHost) for re-directing to the preferred host when handling multiple 
+   domains (i.e. multiple CNAME aliases).
++* [**RecoveryHandler**](https://godoc.org/github.com/gorilla/handlers#RecoveryHandler) for recovering from unexpected panics.
+ 
+ Other handlers are documented [on the Gorilla
+ website](http://www.gorillatoolkit.org/pkg/handlers).
+diff --git a/vendor/github.com/gorilla/handlers/canonical.go b/vendor/github.com/gorilla/handlers/canonical.go
+index 3961695..8437fef 100644
+--- a/vendor/github.com/gorilla/handlers/canonical.go
++++ b/vendor/github.com/gorilla/handlers/canonical.go
+@@ -18,7 +18,6 @@ type canonical struct {
+ //
+ // Note: If the provided domain is considered invalid by url.Parse or otherwise
+ // returns an empty scheme or host, clients are not re-directed.
+-// not re-directed.
+ //
+ // Example:
+ //
+@@ -54,7 +53,11 @@ func (c canonical) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	if !strings.EqualFold(cleanHost(r.Host), dest.Host) {
+ 		// Re-build the destination URL
+ 		dest := dest.Scheme + "://" + dest.Host + r.URL.Path
++		if r.URL.RawQuery != "" {
++			dest += "?" + r.URL.RawQuery
++		}
+ 		http.Redirect(w, r, dest, c.code)
++		return
+ 	}
+ 
+ 	c.h.ServeHTTP(w, r)
+diff --git a/vendor/github.com/gorilla/handlers/compress.go b/vendor/github.com/gorilla/handlers/compress.go
+index 3d90e19..e8345d7 100644
+--- a/vendor/github.com/gorilla/handlers/compress.go
++++ b/vendor/github.com/gorilla/handlers/compress.go
+@@ -16,6 +16,13 @@ type compressResponseWriter struct {
+ 	io.Writer
+ 	http.ResponseWriter
+ 	http.Hijacker
++	http.Flusher
++	http.CloseNotifier
++}
++
++func (w *compressResponseWriter) WriteHeader(c int) {
++	w.ResponseWriter.Header().Del("Content-Length")
++	w.ResponseWriter.WriteHeader(c)
+ }
+ 
+ func (w *compressResponseWriter) Header() http.Header {
+@@ -27,13 +34,46 @@ func (w *compressResponseWriter) Write(b []byte) (int, error) {
+ 	if h.Get("Content-Type") == "" {
+ 		h.Set("Content-Type", http.DetectContentType(b))
+ 	}
++	h.Del("Content-Length")
+ 
+ 	return w.Writer.Write(b)
+ }
+ 
++type flusher interface {
++	Flush() error
++}
++
++func (w *compressResponseWriter) Flush() {
++	// Flush compressed data if compressor supports it.
++	if f, ok := w.Writer.(flusher); ok {
++		f.Flush()
++	}
++	// Flush HTTP response.
++	if w.Flusher != nil {
++		w.Flusher.Flush()
++	}
++}
++
+ // CompressHandler gzip compresses HTTP responses for clients that support it
+ // via the 'Accept-Encoding' header.
++//
++// Compressing TLS traffic may leak the page contents to an attacker if the
++// page contains user input: http://security.stackexchange.com/a/102015/12208
+ func CompressHandler(h http.Handler) http.Handler {
++	return CompressHandlerLevel(h, gzip.DefaultCompression)
++}
++
++// CompressHandlerLevel gzip compresses HTTP responses with specified compression level
++// for clients that support it via the 'Accept-Encoding' header.
++//
++// The compression level should be gzip.DefaultCompression, gzip.NoCompression,
++// or any integer value between gzip.BestSpeed and gzip.BestCompression inclusive.
++// gzip.DefaultCompression is used in case of invalid compression level.
++func CompressHandlerLevel(h http.Handler, level int) http.Handler {
++	if level < gzip.DefaultCompression || level > gzip.BestCompression {
++		level = gzip.DefaultCompression
++	}
++
+ 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 	L:
+ 		for _, enc := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
+@@ -42,7 +82,7 @@ func CompressHandler(h http.Handler) http.Handler {
+ 				w.Header().Set("Content-Encoding", "gzip")
+ 				w.Header().Add("Vary", "Accept-Encoding")
+ 
+-				gw := gzip.NewWriter(w)
++				gw, _ := gzip.NewWriterLevel(w, level)
+ 				defer gw.Close()
+ 
+ 				h, hok := w.(http.Hijacker)
+@@ -50,10 +90,22 @@ func CompressHandler(h http.Handler) http.Handler {
+ 					h = nil
+ 				}
+ 
++				f, fok := w.(http.Flusher)
++				if !fok {
++					f = nil
++				}
++
++				cn, cnok := w.(http.CloseNotifier)
++				if !cnok {
++					cn = nil
++				}
++
+ 				w = &compressResponseWriter{
+ 					Writer:         gw,
+ 					ResponseWriter: w,
+ 					Hijacker:       h,
++					Flusher:        f,
++					CloseNotifier:  cn,
+ 				}
+ 
+ 				break L
+@@ -61,7 +113,7 @@ func CompressHandler(h http.Handler) http.Handler {
+ 				w.Header().Set("Content-Encoding", "deflate")
+ 				w.Header().Add("Vary", "Accept-Encoding")
+ 
+-				fw, _ := flate.NewWriter(w, flate.DefaultCompression)
++				fw, _ := flate.NewWriter(w, level)
+ 				defer fw.Close()
+ 
+ 				h, hok := w.(http.Hijacker)
+@@ -69,10 +121,22 @@ func CompressHandler(h http.Handler) http.Handler {
+ 					h = nil
+ 				}
+ 
++				f, fok := w.(http.Flusher)
++				if !fok {
++					f = nil
++				}
++
++				cn, cnok := w.(http.CloseNotifier)
++				if !cnok {
++					cn = nil
++				}
++
+ 				w = &compressResponseWriter{
+ 					Writer:         fw,
+ 					ResponseWriter: w,
+ 					Hijacker:       h,
++					Flusher:        f,
++					CloseNotifier:  cn,
+ 				}
+ 
+ 				break L
+diff --git a/vendor/github.com/gorilla/handlers/cors.go b/vendor/github.com/gorilla/handlers/cors.go
+new file mode 100644
+index 0000000..1cf7581
+--- /dev/null
++++ b/vendor/github.com/gorilla/handlers/cors.go
+@@ -0,0 +1,327 @@
++package handlers
++
++import (
++	"net/http"
++	"strconv"
++	"strings"
++)
++
++// CORSOption represents a functional option for configuring the CORS middleware.
++type CORSOption func(*cors) error
++
++type cors struct {
++	h                      http.Handler
++	allowedHeaders         []string
++	allowedMethods         []string
++	allowedOrigins         []string
++	allowedOriginValidator OriginValidator
++	exposedHeaders         []string
++	maxAge                 int
++	ignoreOptions          bool
++	allowCredentials       bool
++}
++
++// OriginValidator takes an origin string and returns whether or not that origin is allowed.
++type OriginValidator func(string) bool
++
++var (
++	defaultCorsMethods = []string{"GET", "HEAD", "POST"}
++	defaultCorsHeaders = []string{"Accept", "Accept-Language", "Content-Language", "Origin"}
++	// (WebKit/Safari v9 sends the Origin header by default in AJAX requests)
++)
++
++const (
++	corsOptionMethod           string = "OPTIONS"
++	corsAllowOriginHeader      string = "Access-Control-Allow-Origin"
++	corsExposeHeadersHeader    string = "Access-Control-Expose-Headers"
++	corsMaxAgeHeader           string = "Access-Control-Max-Age"
++	corsAllowMethodsHeader     string = "Access-Control-Allow-Methods"
++	corsAllowHeadersHeader     string = "Access-Control-Allow-Headers"
++	corsAllowCredentialsHeader string = "Access-Control-Allow-Credentials"
++	corsRequestMethodHeader    string = "Access-Control-Request-Method"
++	corsRequestHeadersHeader   string = "Access-Control-Request-Headers"
++	corsOriginHeader           string = "Origin"
++	corsVaryHeader             string = "Vary"
++	corsOriginMatchAll         string = "*"
++)
++
++func (ch *cors) ServeHTTP(w http.ResponseWriter, r *http.Request) {
++	origin := r.Header.Get(corsOriginHeader)
++	if !ch.isOriginAllowed(origin) {
++		ch.h.ServeHTTP(w, r)
++		return
++	}
++
++	if r.Method == corsOptionMethod {
++		if ch.ignoreOptions {
++			ch.h.ServeHTTP(w, r)
++			return
++		}
++
++		if _, ok := r.Header[corsRequestMethodHeader]; !ok {
++			w.WriteHeader(http.StatusBadRequest)
++			return
++		}
++
++		method := r.Header.Get(corsRequestMethodHeader)
++		if !ch.isMatch(method, ch.allowedMethods) {
++			w.WriteHeader(http.StatusMethodNotAllowed)
++			return
++		}
++
++		requestHeaders := strings.Split(r.Header.Get(corsRequestHeadersHeader), ",")
++		allowedHeaders := []string{}
++		for _, v := range requestHeaders {
++			canonicalHeader := http.CanonicalHeaderKey(strings.TrimSpace(v))
++			if canonicalHeader == "" || ch.isMatch(canonicalHeader, defaultCorsHeaders) {
++				continue
++			}
++
++			if !ch.isMatch(canonicalHeader, ch.allowedHeaders) {
++				w.WriteHeader(http.StatusForbidden)
++				return
++			}
++
++			allowedHeaders = append(allowedHeaders, canonicalHeader)
++		}
++
++		if len(allowedHeaders) > 0 {
++			w.Header().Set(corsAllowHeadersHeader, strings.Join(allowedHeaders, ","))
++		}
++
++		if ch.maxAge > 0 {
++			w.Header().Set(corsMaxAgeHeader, strconv.Itoa(ch.maxAge))
++		}
++
++		if !ch.isMatch(method, defaultCorsMethods) {
++			w.Header().Set(corsAllowMethodsHeader, method)
++		}
++	} else {
++		if len(ch.exposedHeaders) > 0 {
++			w.Header().Set(corsExposeHeadersHeader, strings.Join(ch.exposedHeaders, ","))
++		}
++	}
++
++	if ch.allowCredentials {
++		w.Header().Set(corsAllowCredentialsHeader, "true")
++	}
++
++	if len(ch.allowedOrigins) > 1 {
++		w.Header().Set(corsVaryHeader, corsOriginHeader)
++	}
++
++	returnOrigin := origin
++	for _, o := range ch.allowedOrigins {
++		// A configuration of * is different than explicitly setting an allowed
++		// origin. Returning arbitrary origin headers an an access control allow
++		// origin header is unsafe and is not required by any use case.
++		if o == corsOriginMatchAll {
++			returnOrigin = "*"
++			break
++		}
++	}
++	w.Header().Set(corsAllowOriginHeader, returnOrigin)
++
++	if r.Method == corsOptionMethod {
++		return
++	}
++	ch.h.ServeHTTP(w, r)
++}
++
++// CORS provides Cross-Origin Resource Sharing middleware.
++// Example:
++//
++//  import (
++//      "net/http"
++//
++//      "github.com/gorilla/handlers"
++//      "github.com/gorilla/mux"
++//  )
++//
++//  func main() {
++//      r := mux.NewRouter()
++//      r.HandleFunc("/users", UserEndpoint)
++//      r.HandleFunc("/projects", ProjectEndpoint)
++//
++//      // Apply the CORS middleware to our top-level router, with the defaults.
++//      http.ListenAndServe(":8000", handlers.CORS()(r))
++//  }
++//
++func CORS(opts ...CORSOption) func(http.Handler) http.Handler {
++	return func(h http.Handler) http.Handler {
++		ch := parseCORSOptions(opts...)
++		ch.h = h
++		return ch
++	}
++}
++
++func parseCORSOptions(opts ...CORSOption) *cors {
++	ch := &cors{
++		allowedMethods: defaultCorsMethods,
++		allowedHeaders: defaultCorsHeaders,
++		allowedOrigins: []string{corsOriginMatchAll},
++	}
++
++	for _, option := range opts {
++		option(ch)
++	}
++
++	return ch
++}
++
++//
++// Functional options for configuring CORS.
++//
++
++// AllowedHeaders adds the provided headers to the list of allowed headers in a
++// CORS request.
++// This is an append operation so the headers Accept, Accept-Language,
++// and Content-Language are always allowed.
++// Content-Type must be explicitly declared if accepting Content-Types other than
++// application/x-www-form-urlencoded, multipart/form-data, or text/plain.
++func AllowedHeaders(headers []string) CORSOption {
++	return func(ch *cors) error {
++		for _, v := range headers {
++			normalizedHeader := http.CanonicalHeaderKey(strings.TrimSpace(v))
++			if normalizedHeader == "" {
++				continue
++			}
++
++			if !ch.isMatch(normalizedHeader, ch.allowedHeaders) {
++				ch.allowedHeaders = append(ch.allowedHeaders, normalizedHeader)
++			}
++		}
++
++		return nil
++	}
++}
++
++// AllowedMethods can be used to explicitly allow methods in the
++// Access-Control-Allow-Methods header.
++// This is a replacement operation so you must also
++// pass GET, HEAD, and POST if you wish to support those methods.
++func AllowedMethods(methods []string) CORSOption {
++	return func(ch *cors) error {
++		ch.allowedMethods = []string{}
++		for _, v := range methods {
++			normalizedMethod := strings.ToUpper(strings.TrimSpace(v))
++			if normalizedMethod == "" {
++				continue
++			}
++
++			if !ch.isMatch(normalizedMethod, ch.allowedMethods) {
++				ch.allowedMethods = append(ch.allowedMethods, normalizedMethod)
++			}
++		}
++
++		return nil
++	}
++}
++
++// AllowedOrigins sets the allowed origins for CORS requests, as used in the
++// 'Allow-Access-Control-Origin' HTTP header.
++// Note: Passing in a []string{"*"} will allow any domain.
++func AllowedOrigins(origins []string) CORSOption {
++	return func(ch *cors) error {
++		for _, v := range origins {
++			if v == corsOriginMatchAll {
++				ch.allowedOrigins = []string{corsOriginMatchAll}
++				return nil
++			}
++		}
++
++		ch.allowedOrigins = origins
++		return nil
++	}
++}
++
++// AllowedOriginValidator sets a function for evaluating allowed origins in CORS requests, represented by the
++// 'Allow-Access-Control-Origin' HTTP header.
++func AllowedOriginValidator(fn OriginValidator) CORSOption {
++	return func(ch *cors) error {
++		ch.allowedOriginValidator = fn
++		return nil
++	}
++}
++
++// ExposeHeaders can be used to specify headers that are available
++// and will not be stripped out by the user-agent.
++func ExposedHeaders(headers []string) CORSOption {
++	return func(ch *cors) error {
++		ch.exposedHeaders = []string{}
++		for _, v := range headers {
++			normalizedHeader := http.CanonicalHeaderKey(strings.TrimSpace(v))
++			if normalizedHeader == "" {
++				continue
++			}
++
++			if !ch.isMatch(normalizedHeader, ch.exposedHeaders) {
++				ch.exposedHeaders = append(ch.exposedHeaders, normalizedHeader)
++			}
++		}
++
++		return nil
++	}
++}
++
++// MaxAge determines the maximum age (in seconds) between preflight requests. A
++// maximum of 10 minutes is allowed. An age above this value will default to 10
++// minutes.
++func MaxAge(age int) CORSOption {
++	return func(ch *cors) error {
++		// Maximum of 10 minutes.
++		if age > 600 {
++			age = 600
++		}
++
++		ch.maxAge = age
++		return nil
++	}
++}
++
++// IgnoreOptions causes the CORS middleware to ignore OPTIONS requests, instead
++// passing them through to the next handler. This is useful when your application
++// or framework has a pre-existing mechanism for responding to OPTIONS requests.
++func IgnoreOptions() CORSOption {
++	return func(ch *cors) error {
++		ch.ignoreOptions = true
++		return nil
++	}
++}
++
++// AllowCredentials can be used to specify that the user agent may pass
++// authentication details along with the request.
++func AllowCredentials() CORSOption {
++	return func(ch *cors) error {
++		ch.allowCredentials = true
++		return nil
++	}
++}
++
++func (ch *cors) isOriginAllowed(origin string) bool {
++	if origin == "" {
++		return false
++	}
++
++	if ch.allowedOriginValidator != nil {
++		return ch.allowedOriginValidator(origin)
++	}
++
++	for _, allowedOrigin := range ch.allowedOrigins {
++		if allowedOrigin == origin || allowedOrigin == corsOriginMatchAll {
++			return true
++		}
++	}
++
++	return false
++}
++
++func (ch *cors) isMatch(needle string, haystack []string) bool {
++	for _, v := range haystack {
++		if v == needle {
++			return true
++		}
++	}
++
++	return false
++}
+diff --git a/vendor/github.com/gorilla/handlers/handlers.go b/vendor/github.com/gorilla/handlers/handlers.go
+index c3c20e5..75db7f8 100644
+--- a/vendor/github.com/gorilla/handlers/handlers.go
++++ b/vendor/github.com/gorilla/handlers/handlers.go
+@@ -18,16 +18,16 @@ import (
+ 	"unicode/utf8"
+ )
+ 
+-// MethodHandler is an http.Handler that dispatches to a handler whose key in the MethodHandler's
+-// map matches the name of the HTTP request's method, eg: GET
++// MethodHandler is an http.Handler that dispatches to a handler whose key in the
++// MethodHandler's map matches the name of the HTTP request's method, eg: GET
+ //
+-// If the request's method is OPTIONS and OPTIONS is not a key in the map then the handler
+-// responds with a status of 200 and sets the Allow header to a comma-separated list of
+-// available methods.
++// If the request's method is OPTIONS and OPTIONS is not a key in the map then
++// the handler responds with a status of 200 and sets the Allow header to a
++// comma-separated list of available methods.
+ //
+-// If the request's method doesn't match any of its keys the handler responds with
+-// a status of 405, Method not allowed and sets the Allow header to a comma-separated list
+-// of available methods.
++// If the request's method doesn't match any of its keys the handler responds
++// with a status of HTTP 405 "Method Not Allowed" and sets the Allow header to a
++// comma-separated list of available methods.
+ type MethodHandler map[string]http.Handler
+ 
+ func (h MethodHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+@@ -48,13 +48,15 @@ func (h MethodHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+ 	}
+ }
+ 
+-// loggingHandler is the http.Handler implementation for LoggingHandlerTo and its friends
++// loggingHandler is the http.Handler implementation for LoggingHandlerTo and its
++// friends
+ type loggingHandler struct {
+ 	writer  io.Writer
+ 	handler http.Handler
+ }
+ 
+-// combinedLoggingHandler is the http.Handler implementation for LoggingHandlerTo and its friends
++// combinedLoggingHandler is the http.Handler implementation for LoggingHandlerTo
++// and its friends
+ type combinedLoggingHandler struct {
+ 	writer  io.Writer
+ 	handler http.Handler
+@@ -77,9 +79,9 @@ func (h combinedLoggingHandler) ServeHTTP(w http.ResponseWriter, req *http.Reque
+ }
+ 
+ func makeLogger(w http.ResponseWriter) loggingResponseWriter {
+-	var logger loggingResponseWriter = &responseLogger{w: w}
++	var logger loggingResponseWriter = &responseLogger{w: w, status: http.StatusOK}
+ 	if _, ok := w.(http.Hijacker); ok {
+-		logger = &hijackLogger{responseLogger{w: w}}
++		logger = &hijackLogger{responseLogger{w: w, status: http.StatusOK}}
+ 	}
+ 	h, ok1 := logger.(http.Hijacker)
+ 	c, ok2 := w.(http.CloseNotifier)
+@@ -92,15 +94,15 @@ func makeLogger(w http.ResponseWriter) loggingResponseWriter {
+ 	return logger
+ }
+ 
+-type loggingResponseWriter interface {
++type commonLoggingResponseWriter interface {
+ 	http.ResponseWriter
+ 	http.Flusher
+ 	Status() int
+ 	Size() int
+ }
+ 
+-// responseLogger is wrapper of http.ResponseWriter that keeps track of its HTTP status
+-// code and body size
++// responseLogger is wrapper of http.ResponseWriter that keeps track of its HTTP
++// status code and body size
+ type responseLogger struct {
+ 	w      http.ResponseWriter
+ 	status int
+@@ -112,10 +114,6 @@ func (l *responseLogger) Header() http.Header {
+ }
+ 
+ func (l *responseLogger) Write(b []byte) (int, error) {
+-	if l.status == 0 {
+-		// The status will be StatusOK if WriteHeader has not been called yet
+-		l.status = http.StatusOK
+-	}
+ 	size, err := l.w.Write(b)
+ 	l.size += size
+ 	return size, err
+@@ -149,7 +147,8 @@ func (l *hijackLogger) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+ 	h := l.responseLogger.w.(http.Hijacker)
+ 	conn, rw, err := h.Hijack()
+ 	if err == nil && l.responseLogger.status == 0 {
+-		// The status will be StatusSwitchingProtocols if there was no error and WriteHeader has not been called yet
++		// The status will be StatusSwitchingProtocols if there was no error and
++		// WriteHeader has not been called yet
+ 		l.responseLogger.status = http.StatusSwitchingProtocols
+ 	}
+ 	return conn, rw, err
+@@ -250,7 +249,17 @@ func buildCommonLogLine(req *http.Request, url url.URL, ts time.Time, status int
+ 		host = req.RemoteAddr
+ 	}
+ 
+-	uri := url.RequestURI()
++	uri := req.RequestURI
++
++	// Requests using the CONNECT method over HTTP/2.0 must use
++	// the authority field (aka r.Host) to identify the target.
++	// Refer: https://httpwg.github.io/specs/rfc7540.html#CONNECT
++	if req.ProtoMajor == 2 && req.Method == "CONNECT" {
++		uri = req.Host
++	}
++	if uri == "" {
++		uri = url.RequestURI()
++	}
+ 
+ 	buf := make([]byte, 0, 3*(len(host)+len(username)+len(req.Method)+len(uri)+len(req.Proto)+50)/2)
+ 	buf = append(buf, host...)
+@@ -309,12 +318,22 @@ func CombinedLoggingHandler(out io.Writer, h http.Handler) http.Handler {
+ // See http://httpd.apache.org/docs/2.2/logs.html#common for a description of this format.
+ //
+ // LoggingHandler always sets the ident field of the log to -
++//
++// Example:
++//
++//  r := mux.NewRouter()
++//  r.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
++//  	w.Write([]byte("This is a catch-all route"))
++//  })
++//  loggedRouter := handlers.LoggingHandler(os.Stdout, r)
++//  http.ListenAndServe(":1123", loggedRouter)
++//
+ func LoggingHandler(out io.Writer, h http.Handler) http.Handler {
+ 	return loggingHandler{out, h}
+ }
+ 
+-// isContentType validates the Content-Type header
+-// is contentType. That is, its type and subtype match.
++// isContentType validates the Content-Type header matches the supplied
++// contentType. That is, its type and subtype match.
+ func isContentType(h http.Header, contentType string) bool {
+ 	ct := h.Get("Content-Type")
+ 	if i := strings.IndexRune(ct, ';'); i != -1 {
+@@ -323,9 +342,9 @@ func isContentType(h http.Header, contentType string) bool {
+ 	return ct == contentType
+ }
+ 
+-// ContentTypeHandler wraps and returns a http.Handler, validating the request content type
+-// is acompatible with the contentTypes list.
+-// It writes a HTTP 415 error if that fails.
++// ContentTypeHandler wraps and returns a http.Handler, validating the request
++// content type is compatible with the contentTypes list. It writes a HTTP 415
++// error if that fails.
+ //
+ // Only PUT, POST, and PATCH requests are considered.
+ func ContentTypeHandler(h http.Handler, contentTypes ...string) http.Handler {
+@@ -354,12 +373,14 @@ const (
+ 	HTTPMethodOverrideFormKey = "_method"
+ )
+ 
+-// HTTPMethodOverrideHandler wraps and returns a http.Handler which checks for the X-HTTP-Method-Override header
+-// or the _method form key, and overrides (if valid) request.Method with its value.
++// HTTPMethodOverrideHandler wraps and returns a http.Handler which checks for
++// the X-HTTP-Method-Override header or the _method form key, and overrides (if
++// valid) request.Method with its value.
+ //
+-// This is especially useful for http clients that don't support many http verbs.
+-// It isn't secure to override e.g a GET to a POST, so only POST requests are considered.
+-// Likewise, the override method can only be a "write" method: PUT, PATCH or DELETE.
++// This is especially useful for HTTP clients that don't support many http verbs.
++// It isn't secure to override e.g a GET to a POST, so only POST requests are
++// considered.  Likewise, the override method can only be a "write" method: PUT,
++// PATCH or DELETE.
+ //
+ // Form method takes precedence over header method.
+ func HTTPMethodOverrideHandler(h http.Handler) http.Handler {
+diff --git a/vendor/github.com/gorilla/handlers/handlers_go18.go b/vendor/github.com/gorilla/handlers/handlers_go18.go
+new file mode 100644
+index 0000000..35eb8d4
+--- /dev/null
++++ b/vendor/github.com/gorilla/handlers/handlers_go18.go
+@@ -0,0 +1,21 @@
++// +build go1.8
++
++package handlers
++
++import (
++	"fmt"
++	"net/http"
++)
++
++type loggingResponseWriter interface {
++	commonLoggingResponseWriter
++	http.Pusher
++}
++
++func (l *responseLogger) Push(target string, opts *http.PushOptions) error {
++	p, ok := l.w.(http.Pusher)
++	if !ok {
++		return fmt.Errorf("responseLogger does not implement http.Pusher")
++	}
++	return p.Push(target, opts)
++}
+diff --git a/vendor/github.com/gorilla/handlers/handlers_pre18.go b/vendor/github.com/gorilla/handlers/handlers_pre18.go
+new file mode 100644
+index 0000000..197836a
+--- /dev/null
++++ b/vendor/github.com/gorilla/handlers/handlers_pre18.go
+@@ -0,0 +1,7 @@
++// +build !go1.8
++
++package handlers
++
++type loggingResponseWriter interface {
++	commonLoggingResponseWriter
++}
+diff --git a/vendor/github.com/gorilla/handlers/proxy_headers.go b/vendor/github.com/gorilla/handlers/proxy_headers.go
+index 268de9c..0be750f 100644
+--- a/vendor/github.com/gorilla/handlers/proxy_headers.go
++++ b/vendor/github.com/gorilla/handlers/proxy_headers.go
+@@ -8,9 +8,11 @@ import (
+ 
+ var (
+ 	// De-facto standard header keys.
+-	xForwardedFor   = http.CanonicalHeaderKey("X-Forwarded-For")
+-	xRealIP         = http.CanonicalHeaderKey("X-Real-IP")
+-	xForwardedProto = http.CanonicalHeaderKey("X-Forwarded-Scheme")
++	xForwardedFor    = http.CanonicalHeaderKey("X-Forwarded-For")
++	xForwardedHost   = http.CanonicalHeaderKey("X-Forwarded-Host")
++	xForwardedProto  = http.CanonicalHeaderKey("X-Forwarded-Proto")
++	xForwardedScheme = http.CanonicalHeaderKey("X-Forwarded-Scheme")
++	xRealIP          = http.CanonicalHeaderKey("X-Real-IP")
+ )
+ 
+ var (
+@@ -28,9 +30,9 @@ var (
+ 
+ // ProxyHeaders inspects common reverse proxy headers and sets the corresponding
+ // fields in the HTTP request struct. These are X-Forwarded-For and X-Real-IP
+-// for the remote (client) IP address, X-Forwarded-Proto for the scheme
+-// (http|https) and the RFC7239 Forwarded header, which may include both client
+-// IPs and schemes.
++// for the remote (client) IP address, X-Forwarded-Proto or X-Forwarded-Scheme
++// for the scheme (http|https) and the RFC7239 Forwarded header, which may
++// include both client IPs and schemes.
+ //
+ // NOTE: This middleware should only be used when behind a reverse
+ // proxy like nginx, HAProxy or Apache. Reverse proxies that don't (or are
+@@ -49,7 +51,10 @@ func ProxyHeaders(h http.Handler) http.Handler {
+ 		if scheme := getScheme(r); scheme != "" {
+ 			r.URL.Scheme = scheme
+ 		}
+-
++		// Set the host with the value passed by the proxy
++		if r.Header.Get(xForwardedHost) != "" {
++			r.Host = r.Header.Get(xForwardedHost)
++		}
+ 		// Call the next handler in the chain.
+ 		h.ServeHTTP(w, r)
+ 	}
+@@ -99,7 +104,9 @@ func getScheme(r *http.Request) string {
+ 	// Retrieve the scheme from X-Forwarded-Proto.
+ 	if proto := r.Header.Get(xForwardedProto); proto != "" {
+ 		scheme = strings.ToLower(proto)
+-	} else if proto := r.Header.Get(forwarded); proto != "" {
++	} else if proto = r.Header.Get(xForwardedScheme); proto != "" {
++		scheme = strings.ToLower(proto)
++	} else if proto = r.Header.Get(forwarded); proto != "" {
+ 		// match should contain at least two elements if the protocol was
+ 		// specified in the Forwarded header. The first element will always be
+ 		// the 'proto=' capture, which we ignore. In the case of multiple proto
+diff --git a/vendor/github.com/gorilla/handlers/recovery.go b/vendor/github.com/gorilla/handlers/recovery.go
+new file mode 100644
+index 0000000..b1be9dc
+--- /dev/null
++++ b/vendor/github.com/gorilla/handlers/recovery.go
+@@ -0,0 +1,91 @@
++package handlers
++
++import (
++	"log"
++	"net/http"
++	"runtime/debug"
++)
++
++// RecoveryHandlerLogger is an interface used by the recovering handler to print logs.
++type RecoveryHandlerLogger interface {
++	Println(...interface{})
++}
++
++type recoveryHandler struct {
++	handler    http.Handler
++	logger     RecoveryHandlerLogger
++	printStack bool
++}
++
++// RecoveryOption provides a functional approach to define
++// configuration for a handler; such as setting the logging
++// whether or not to print strack traces on panic.
++type RecoveryOption func(http.Handler)
++
++func parseRecoveryOptions(h http.Handler, opts ...RecoveryOption) http.Handler {
++	for _, option := range opts {
++		option(h)
++	}
++
++	return h
++}
++
++// RecoveryHandler is HTTP middleware that recovers from a panic,
++// logs the panic, writes http.StatusInternalServerError, and
++// continues to the next handler.
++//
++// Example:
++//
++//  r := mux.NewRouter()
++//  r.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
++//  	panic("Unexpected error!")
++//  })
++//
++//  http.ListenAndServe(":1123", handlers.RecoveryHandler()(r))
++func RecoveryHandler(opts ...RecoveryOption) func(h http.Handler) http.Handler {
++	return func(h http.Handler) http.Handler {
++		r := &recoveryHandler{handler: h}
++		return parseRecoveryOptions(r, opts...)
++	}
++}
++
++// RecoveryLogger is a functional option to override
++// the default logger
++func RecoveryLogger(logger RecoveryHandlerLogger) RecoveryOption {
++	return func(h http.Handler) {
++		r := h.(*recoveryHandler)
++		r.logger = logger
++	}
++}
++
++// PrintRecoveryStack is a functional option to enable
++// or disable printing stack traces on panic.
++func PrintRecoveryStack(print bool) RecoveryOption {
++	return func(h http.Handler) {
++		r := h.(*recoveryHandler)
++		r.printStack = print
++	}
++}
++
++func (h recoveryHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
++	defer func() {
++		if err := recover(); err != nil {
++			w.WriteHeader(http.StatusInternalServerError)
++			h.log(err)
++		}
++	}()
++
++	h.handler.ServeHTTP(w, req)
++}
++
++func (h recoveryHandler) log(v ...interface{}) {
++	if h.logger != nil {
++		h.logger.Println(v...)
++	} else {
++		log.Println(v...)
++	}
++
++	if h.printStack {
++		debug.PrintStack()
++	}
++}
+diff --git a/vendor/gopkg.in/square/go-jose.v1/.gitcookies.sh.enc b/vendor/gopkg.in/square/go-jose.v1/.gitcookies.sh.enc
+new file mode 100644
+index 0000000..730e569
+--- /dev/null
++++ b/vendor/gopkg.in/square/go-jose.v1/.gitcookies.sh.enc
+@@ -0,0 +1 @@
++'| &{tƒU|gGÍ(ÏèCy=+®úÚc˚:u:/pú#~û¸["±4§!≠nŸA™DK<äufˇh≈aø¬:∫¸∏°¥B/£ÿ§π§Ú_ÅhŒ€S„T*wÃxºØùπ-Á|ù‡¿”É—ƒ‰ÛÃ„£óA$$‚6£¡‚G)8nœp˚∆À°3ÃöúoÔœvéBñ3ø≠]x›ì”2lßGï|qRﬁØˆ25Rñ”◊«$¥ÒΩYË°ﬁ›ôlëÀ´yAI"€åòÆÌ√ªπºkƒ|KÂ˛[9∆‚“Â=∞˙ˇüÒ|@Sï3Û#Êùx?æVÑ,æÇS∆›ıúwPÌog“6&V6	©D.dBä7
+\ No newline at end of file
+diff --git a/vendor/gopkg.in/square/go-jose.v1/.gitignore b/vendor/gopkg.in/square/go-jose.v1/.gitignore
+new file mode 100644
+index 0000000..5b4d73b
+--- /dev/null
++++ b/vendor/gopkg.in/square/go-jose.v1/.gitignore
+@@ -0,0 +1,7 @@
++*~
++.*.swp
++*.out
++*.test
++*.pem
++*.cov
++jose-util/jose-util
+diff --git a/vendor/gopkg.in/square/go-jose.v1/.travis.yml b/vendor/gopkg.in/square/go-jose.v1/.travis.yml
+new file mode 100644
+index 0000000..4825021
+--- /dev/null
++++ b/vendor/gopkg.in/square/go-jose.v1/.travis.yml
+@@ -0,0 +1,45 @@
++language: go
++
++sudo: false
++
++matrix:
++  fast_finish: true
++  allow_failures:
++    - go: tip
++
++go:
++- '1.5.x'
++- '1.6.x'
++- '1.7.x'
++- '1.8.x'
++- '1.9.x'
++- '1.10.x'
++
++go_import_path: gopkg.in/square/go-jose.v1
++
++before_script:
++- export PATH=$HOME/.local/bin:$PATH
++
++before_install:
++# Install encrypted gitcookies to get around bandwidth-limits
++# that is causing Travis-CI builds to fail. For more info, see
++# https://github.com/golang/go/issues/12933
++- openssl aes-256-cbc -K $encrypted_1528c3c2cafd_key -iv $encrypted_1528c3c2cafd_iv -in .gitcookies.sh.enc -out .gitcookies.sh -d || true
++- bash .gitcookies.sh || true
++- go get github.com/wadey/gocovmerge
++- go get github.com/mattn/goveralls
++- go get golang.org/x/tools/cmd/cover || true
++- go get code.google.com/p/go.tools/cmd/cover || true
++- pip install cram --user
++
++script:
++- go test . -v -covermode=count -coverprofile=profile.cov
++- go test ./cipher -v -covermode=count -coverprofile=cipher/profile.cov
++- go test ./json -v # no coverage for forked encoding/json package
++- cd jose-util && go build && PATH=$PWD:$PATH cram -v jose-util.t
++- cd ..
++
++after_success:
++- gocovmerge *.cov */*.cov > merged.coverprofile
++- $HOME/gopath/bin/goveralls -coverprofile merged.coverprofile -service=travis-ci
++
+diff --git a/vendor/gopkg.in/square/go-jose.v1/BUG-BOUNTY.md b/vendor/gopkg.in/square/go-jose.v1/BUG-BOUNTY.md
+new file mode 100644
+index 0000000..3305db0
+--- /dev/null
++++ b/vendor/gopkg.in/square/go-jose.v1/BUG-BOUNTY.md
+@@ -0,0 +1,10 @@
++Serious about security
++======================
++
++Square recognizes the important contributions the security research community
++can make. We therefore encourage reporting security issues with the code
++contained in this repository.
++
++If you believe you have discovered a security vulnerability, please follow the
++guidelines at <https://bugcrowd.com/squareopensource>.
++
+diff --git a/vendor/gopkg.in/square/go-jose.v1/CONTRIBUTING.md b/vendor/gopkg.in/square/go-jose.v1/CONTRIBUTING.md
+new file mode 100644
+index 0000000..61b1836
+--- /dev/null
++++ b/vendor/gopkg.in/square/go-jose.v1/CONTRIBUTING.md
+@@ -0,0 +1,14 @@
++# Contributing
++
++If you would like to contribute code to go-jose you can do so through GitHub by
++forking the repository and sending a pull request.
++
++When submitting code, please make every effort to follow existing conventions
++and style in order to keep the code as readable as possible. Please also make
++sure all tests pass by running `go test`, and format your code with `go fmt`.
++We also recommend using `golint` and `errcheck`.
++
++Before your code can be accepted into the project you must also sign the
++[Individual Contributor License Agreement][1].
++
++ [1]: https://spreadsheets.google.com/spreadsheet/viewform?formkey=dDViT2xzUHAwRkI3X3k5Z0lQM091OGc6MQ&ndplr=1
+diff --git a/vendor/gopkg.in/square/go-jose.v1/README.md b/vendor/gopkg.in/square/go-jose.v1/README.md
+index fd859da..e4f4495 100644
+--- a/vendor/gopkg.in/square/go-jose.v1/README.md
++++ b/vendor/gopkg.in/square/go-jose.v1/README.md
+@@ -1,10 +1,14 @@
+ # Go JOSE 
+ 
+-[![godoc](http://img.shields.io/badge/godoc-reference-blue.svg?style=flat)](https://godoc.org/gopkg.in/square/go-jose.v1) [![license](http://img.shields.io/badge/license-apache_2.0-red.svg?style=flat)](https://raw.githubusercontent.com/square/go-jose/master/LICENSE) [![build](https://travis-ci.org/square/go-jose.svg?branch=master)](https://travis-ci.org/square/go-jose) [![coverage](https://coveralls.io/repos/github/square/go-jose/badge.svg?branch=master)](https://coveralls.io/r/square/go-jose)
++[![godoc](http://img.shields.io/badge/godoc-version_1-blue.svg?style=flat)](https://godoc.org/gopkg.in/square/go-jose.v1)
++[![godoc](http://img.shields.io/badge/godoc-version_2-blue.svg?style=flat)](https://godoc.org/gopkg.in/square/go-jose.v2)
++[![license](http://img.shields.io/badge/license-apache_2.0-blue.svg?style=flat)](https://raw.githubusercontent.com/square/go-jose/master/LICENSE)
++[![build](https://travis-ci.org/square/go-jose.svg?branch=v1)](https://travis-ci.org/square/go-jose)
++[![coverage](https://coveralls.io/repos/github/square/go-jose/badge.svg?branch=v1)](https://coveralls.io/r/square/go-jose)
+ 
+ Package jose aims to provide an implementation of the Javascript Object Signing
+-and Encryption set of standards. For the moment, it mainly focuses on encryption
+-and signing based on the JSON Web Encryption and JSON Web Signature standards.
++and Encryption set of standards. This includes support for JSON Web Encryption,
++JSON Web Signature, and JSON Web Token standards.
+ 
+ **Disclaimer**: This library contains encryption software that is subject to
+ the U.S. Export Administration Regulations. You may not export, re-export,
+@@ -17,44 +21,43 @@ US maintained blocked list.
+ ## Overview
+ 
+ The implementation follows the
+-[JSON Web Encryption](http://dx.doi.org/10.17487/RFC7516)
+-standard (RFC 7516) and
+-[JSON Web Signature](http://dx.doi.org/10.17487/RFC7515)
+-standard (RFC 7515). Tables of supported algorithms are shown below.
+-The library supports both the compact and full serialization formats, and has
+-optional support for multiple recipients. It also comes with a small
+-command-line utility
+-([`jose-util`](https://github.com/square/go-jose/tree/master/jose-util))
++[JSON Web Encryption](http://dx.doi.org/10.17487/RFC7516) (RFC 7516),
++[JSON Web Signature](http://dx.doi.org/10.17487/RFC7515) (RFC 7515), and
++[JSON Web Token](http://dx.doi.org/10.17487/RFC7519) (RFC 7519).
++Tables of supported algorithms are shown below. The library supports both
++the compact and full serialization formats, and has optional support for
++multiple recipients. It also comes with a small command-line utility
++([`jose-util`](https://github.com/square/go-jose/tree/v2/jose-util))
+ for dealing with JOSE messages in a shell.
+ 
+ **Note**: We use a forked version of the `encoding/json` package from the Go
+ standard library which uses case-sensitive matching for member names (instead
+ of [case-insensitive matching](https://www.ietf.org/mail-archive/web/json/current/msg03763.html)).
+ This is to avoid differences in interpretation of messages between go-jose and
+-libraries in other languages. If you do not like this behavior, you can use the
+-`std_json` build tag to disable it (though we do not recommend doing so).
++libraries in other languages.
+ 
+ ### Versions
+ 
+ We use [gopkg.in](https://gopkg.in) for versioning.
+ 
+-[Version 1](https://gopkg.in/square/go-jose.v1) is the current stable version:
++[Version 2](https://gopkg.in/square/go-jose.v2)
++([branch](https://github.com/square/go-jose/tree/v2),
++[doc](https://godoc.org/gopkg.in/square/go-jose.v2)) is the current version:
+ 
+-    import "gopkg.in/square/go-jose.v1"
++    import "gopkg.in/square/go-jose.v2"
+ 
+-The interface for [go-jose.v1](https://gopkg.in/square/go-jose.v1) will remain
+-backwards compatible. We're currently sketching out ideas for a new version, to
+-clean up the interface a bit. If you have ideas or feature requests [please let
+-us know](https://github.com/square/go-jose/issues/64)!
++The old `v1` branch ([go-jose.v1](https://gopkg.in/square/go-jose.v1)) will
++still receive backported bug fixes and security fixes, but otherwise
++development is frozen. All new feature development takes place on the `v2`
++branch. Version 2 also contains additional sub-packages such as the
++[jwt](https://godoc.org/gopkg.in/square/go-jose.v2/jwt) implementation
++contributed by [@shaxbee](https://github.com/shaxbee).
+ 
+ ### Supported algorithms
+ 
+ See below for a table of supported algorithms. Algorithm identifiers match
+-the names in the
+-[JSON Web Algorithms](http://dx.doi.org/10.17487/RFC7518)
+-standard where possible. The
+-[Godoc reference](https://godoc.org/github.com/square/go-jose#pkg-constants)
+-has a list of constants.
++the names in the [JSON Web Algorithms](http://dx.doi.org/10.17487/RFC7518)
++standard where possible. The Godoc reference has a list of constants.
+ 
+  Key encryption             | Algorithm identifier(s)
+  :------------------------- | :------------------------------
+@@ -74,6 +77,9 @@ has a list of constants.
+  RSASSA-PSS                 | PS256, PS384, PS512
+  HMAC                       | HS256, HS384, HS512
+  ECDSA                      | ES256, ES384, ES512
++ Ed25519                    | EdDSA<sup>2</sup>
++
++<sup>2. Only available in version 2 of the package</sup>
+ 
+  Content encryption         | Algorithm identifier(s)
+  :------------------------- | :------------------------------
+@@ -88,122 +94,25 @@ has a list of constants.
+ 
+ See below for a table of supported key types. These are understood by the
+ library, and can be passed to corresponding functions such as `NewEncrypter` or
+-`NewSigner`. Note that if you are creating a new encrypter or signer with a
+-JsonWebKey, the key id of the JsonWebKey (if present) will be added to any
+-resulting messages.
++`NewSigner`. Each of these keys can also be wrapped in a JWK if desired, which
++allows attaching a key id.
+ 
+  Algorithm(s)               | Corresponding types
+  :------------------------- | -------------------------------
+- RSA                        | *[rsa.PublicKey](http://golang.org/pkg/crypto/rsa/#PublicKey), *[rsa.PrivateKey](http://golang.org/pkg/crypto/rsa/#PrivateKey), *[jose.JsonWebKey](https://godoc.org/github.com/square/go-jose#JsonWebKey)
+- ECDH, ECDSA                | *[ecdsa.PublicKey](http://golang.org/pkg/crypto/ecdsa/#PublicKey), *[ecdsa.PrivateKey](http://golang.org/pkg/crypto/ecdsa/#PrivateKey), *[jose.JsonWebKey](https://godoc.org/github.com/square/go-jose#JsonWebKey)
+- AES, HMAC                  | []byte, *[jose.JsonWebKey](https://godoc.org/github.com/square/go-jose#JsonWebKey)
++ RSA                        | *[rsa.PublicKey](http://golang.org/pkg/crypto/rsa/#PublicKey), *[rsa.PrivateKey](http://golang.org/pkg/crypto/rsa/#PrivateKey)
++ ECDH, ECDSA                | *[ecdsa.PublicKey](http://golang.org/pkg/crypto/ecdsa/#PublicKey), *[ecdsa.PrivateKey](http://golang.org/pkg/crypto/ecdsa/#PrivateKey)
++ EdDSA<sup>1</sup>          | [ed25519.PublicKey](https://godoc.org/golang.org/x/crypto/ed25519#PublicKey), [ed25519.PrivateKey](https://godoc.org/golang.org/x/crypto/ed25519#PrivateKey)
++ AES, HMAC                  | []byte
++
++<sup>1. Only available in version 2 of the package</sup>
+ 
+ ## Examples
+ 
+-Encryption/decryption example using RSA:
+-
+-```Go
+-// Generate a public/private key pair to use for this example. The library
+-// also provides two utility functions (LoadPublicKey and LoadPrivateKey)
+-// that can be used to load keys from PEM/DER-encoded data.
+-privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+-if err != nil {
+-	panic(err)
+-}
+-
+-// Instantiate an encrypter using RSA-OAEP with AES128-GCM. An error would
+-// indicate that the selected algorithm(s) are not currently supported.
+-publicKey := &privateKey.PublicKey
+-encrypter, err := NewEncrypter(RSA_OAEP, A128GCM, publicKey)
+-if err != nil {
+-	panic(err)
+-}
+-
+-// Encrypt a sample plaintext. Calling the encrypter returns an encrypted
+-// JWE object, which can then be serialized for output afterwards. An error
+-// would indicate a problem in an underlying cryptographic primitive.
+-var plaintext = []byte("Lorem ipsum dolor sit amet")
+-object, err := encrypter.Encrypt(plaintext)
+-if err != nil {
+-	panic(err)
+-}
+-
+-// Serialize the encrypted object using the full serialization format.
+-// Alternatively you can also use the compact format here by calling
+-// object.CompactSerialize() instead.
+-serialized := object.FullSerialize()
+-
+-// Parse the serialized, encrypted JWE object. An error would indicate that
+-// the given input did not represent a valid message.
+-object, err = ParseEncrypted(serialized)
+-if err != nil {
+-	panic(err)
+-}
+-
+-// Now we can decrypt and get back our original plaintext. An error here
+-// would indicate the the message failed to decrypt, e.g. because the auth
+-// tag was broken or the message was tampered with.
+-decrypted, err := object.Decrypt(privateKey)
+-if err != nil {
+-	panic(err)
+-}
+-
+-fmt.Printf(string(decrypted))
+-// output: Lorem ipsum dolor sit amet
+-```
+-
+-Signing/verification example using RSA:
+-
+-```Go
+-// Generate a public/private key pair to use for this example. The library
+-// also provides two utility functions (LoadPublicKey and LoadPrivateKey)
+-// that can be used to load keys from PEM/DER-encoded data.
+-privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+-if err != nil {
+-	panic(err)
+-}
+-
+-// Instantiate a signer using RSASSA-PSS (SHA512) with the given private key.
+-signer, err := NewSigner(PS512, privateKey)
+-if err != nil {
+-	panic(err)
+-}
+-
+-// Sign a sample payload. Calling the signer returns a protected JWS object,
+-// which can then be serialized for output afterwards. An error would
+-// indicate a problem in an underlying cryptographic primitive.
+-var payload = []byte("Lorem ipsum dolor sit amet")
+-object, err := signer.Sign(payload)
+-if err != nil {
+-	panic(err)
+-}
+-
+-// Serialize the encrypted object using the full serialization format.
+-// Alternatively you can also use the compact format here by calling
+-// object.CompactSerialize() instead.
+-serialized := object.FullSerialize()
+-
+-// Parse the serialized, protected JWS object. An error would indicate that
+-// the given input did not represent a valid message.
+-object, err = ParseSigned(serialized)
+-if err != nil {
+-	panic(err)
+-}
+-
+-// Now we can verify the signature on the payload. An error here would
+-// indicate the the message failed to verify, e.g. because the signature was
+-// broken or the message was tampered with.
+-output, err := object.Verify(&privateKey.PublicKey)
+-if err != nil {
+-	panic(err)
+-}
+-
+-fmt.Printf(string(output))
+-// output: Lorem ipsum dolor sit amet
+-```
+-
+-More examples can be found in the [Godoc
+-reference](https://godoc.org/github.com/square/go-jose) for this package. The
+-[`jose-util`](https://github.com/square/go-jose/tree/master/jose-util)
+-subdirectory also contains a small command-line utility which might
+-be useful as an example.
++[![godoc](http://img.shields.io/badge/godoc-version_1-blue.svg?style=flat)](https://godoc.org/gopkg.in/square/go-jose.v1)
++[![godoc](http://img.shields.io/badge/godoc-version_2-blue.svg?style=flat)](https://godoc.org/gopkg.in/square/go-jose.v2)
++
++Examples can be found in the Godoc
++reference for this package. The
++[`jose-util`](https://github.com/square/go-jose/tree/v2/jose-util)
++subdirectory also contains a small command-line utility which might be useful
++as an example.
+diff --git a/vendor/gopkg.in/square/go-jose.v1/asymmetric.go b/vendor/gopkg.in/square/go-jose.v1/asymmetric.go
+index 381156c..cd36c21 100644
+--- a/vendor/gopkg.in/square/go-jose.v1/asymmetric.go
++++ b/vendor/gopkg.in/square/go-jose.v1/asymmetric.go
+@@ -67,6 +67,10 @@ func newRSARecipient(keyAlg KeyAlgorithm, publicKey *rsa.PublicKey) (recipientKe
+ 		return recipientKeyInfo{}, ErrUnsupportedAlgorithm
+ 	}
+ 
++	if publicKey == nil {
++		return recipientKeyInfo{}, errors.New("invalid public key")
++	}
++
+ 	return recipientKeyInfo{
+ 		keyAlg: keyAlg,
+ 		keyEncrypter: &rsaEncrypterVerifier{
+@@ -84,6 +88,10 @@ func newRSASigner(sigAlg SignatureAlgorithm, privateKey *rsa.PrivateKey) (recipi
+ 		return recipientSigInfo{}, ErrUnsupportedAlgorithm
+ 	}
+ 
++	if privateKey == nil {
++		return recipientSigInfo{}, errors.New("invalid private key")
++	}
++
+ 	return recipientSigInfo{
+ 		sigAlg: sigAlg,
+ 		publicKey: &JsonWebKey{
+@@ -104,6 +112,10 @@ func newECDHRecipient(keyAlg KeyAlgorithm, publicKey *ecdsa.PublicKey) (recipien
+ 		return recipientKeyInfo{}, ErrUnsupportedAlgorithm
+ 	}
+ 
++	if publicKey == nil || !publicKey.Curve.IsOnCurve(publicKey.X, publicKey.Y) {
++		return recipientKeyInfo{}, errors.New("invalid public key")
++	}
++
+ 	return recipientKeyInfo{
+ 		keyAlg: keyAlg,
+ 		keyEncrypter: &ecEncrypterVerifier{
+@@ -121,6 +133,10 @@ func newECDSASigner(sigAlg SignatureAlgorithm, privateKey *ecdsa.PrivateKey) (re
+ 		return recipientSigInfo{}, ErrUnsupportedAlgorithm
+ 	}
+ 
++	if privateKey == nil {
++		return recipientSigInfo{}, errors.New("invalid private key")
++	}
++
+ 	return recipientSigInfo{
+ 		sigAlg: sigAlg,
+ 		publicKey: &JsonWebKey{
+@@ -199,7 +215,7 @@ func (ctx rsaDecrypterSigner) decrypt(jek []byte, alg KeyAlgorithm, generator ke
+ 		// When decrypting an RSA-PKCS1v1.5 payload, we must take precautions to
+ 		// prevent chosen-ciphertext attacks as described in RFC 3218, "Preventing
+ 		// the Million Message Attack on Cryptographic Message Syntax". We are
+-		// therefore deliberatly ignoring errors here.
++		// therefore deliberately ignoring errors here.
+ 		_ = rsa.DecryptPKCS1v15SessionKey(rand.Reader, ctx.privateKey, jek, cek)
+ 
+ 		return cek, nil
+@@ -370,6 +386,10 @@ func (ctx ecDecrypterSigner) decryptKey(headers rawHeader, recipient *recipientI
+ 		return nil, errors.New("square/go-jose: invalid epk header")
+ 	}
+ 
++	if !ctx.privateKey.Curve.IsOnCurve(publicKey.X, publicKey.Y) {
++		return nil, errors.New("square/go-jose: invalid public key in epk header")
++	}
++
+ 	apuData := headers.Apu.bytes()
+ 	apvData := headers.Apv.bytes()
+ 
+@@ -474,6 +494,8 @@ func (ctx ecEncrypterVerifier) verifyPayload(payload []byte, signature []byte, a
+ 	case ES512:
+ 		keySize = 66
+ 		hash = crypto.SHA512
++	default:
++		return ErrUnsupportedAlgorithm
+ 	}
+ 
+ 	if len(signature) != 2*keySize {
+diff --git a/vendor/gopkg.in/square/go-jose.v1/cipher/cbc_hmac.go b/vendor/gopkg.in/square/go-jose.v1/cipher/cbc_hmac.go
+index a5c3583..126b85c 100644
+--- a/vendor/gopkg.in/square/go-jose.v1/cipher/cbc_hmac.go
++++ b/vendor/gopkg.in/square/go-jose.v1/cipher/cbc_hmac.go
+@@ -82,7 +82,7 @@ func (ctx *cbcAEAD) Overhead() int {
+ // Seal encrypts and authenticates the plaintext.
+ func (ctx *cbcAEAD) Seal(dst, nonce, plaintext, data []byte) []byte {
+ 	// Output buffer -- must take care not to mangle plaintext input.
+-	ciphertext := make([]byte, len(plaintext)+ctx.Overhead())[:len(plaintext)]
++	ciphertext := make([]byte, uint64(len(plaintext))+uint64(ctx.Overhead()))[:len(plaintext)]
+ 	copy(ciphertext, plaintext)
+ 	ciphertext = padBuffer(ciphertext, ctx.blockCipher.BlockSize())
+ 
+@@ -91,7 +91,7 @@ func (ctx *cbcAEAD) Seal(dst, nonce, plaintext, data []byte) []byte {
+ 	cbc.CryptBlocks(ciphertext, ciphertext)
+ 	authtag := ctx.computeAuthTag(data, nonce, ciphertext)
+ 
+-	ret, out := resize(dst, len(dst)+len(ciphertext)+len(authtag))
++	ret, out := resize(dst, uint64(len(dst))+uint64(len(ciphertext))+uint64(len(authtag)))
+ 	copy(out, ciphertext)
+ 	copy(out[len(ciphertext):], authtag)
+ 
+@@ -128,7 +128,7 @@ func (ctx *cbcAEAD) Open(dst, nonce, ciphertext, data []byte) ([]byte, error) {
+ 		return nil, err
+ 	}
+ 
+-	ret, out := resize(dst, len(dst)+len(plaintext))
++	ret, out := resize(dst, uint64(len(dst))+uint64(len(plaintext)))
+ 	copy(out, plaintext)
+ 
+ 	return ret, nil
+@@ -136,12 +136,12 @@ func (ctx *cbcAEAD) Open(dst, nonce, ciphertext, data []byte) ([]byte, error) {
+ 
+ // Compute an authentication tag
+ func (ctx *cbcAEAD) computeAuthTag(aad, nonce, ciphertext []byte) []byte {
+-	buffer := make([]byte, len(aad)+len(nonce)+len(ciphertext)+8)
++	buffer := make([]byte, uint64(len(aad))+uint64(len(nonce))+uint64(len(ciphertext))+8)
+ 	n := 0
+ 	n += copy(buffer, aad)
+ 	n += copy(buffer[n:], nonce)
+ 	n += copy(buffer[n:], ciphertext)
+-	binary.BigEndian.PutUint64(buffer[n:], uint64(len(aad)*8))
++	binary.BigEndian.PutUint64(buffer[n:], uint64(len(aad))*8)
+ 
+ 	// According to documentation, Write() on hash.Hash never fails.
+ 	hmac := hmac.New(ctx.hash, ctx.integrityKey)
+@@ -153,8 +153,8 @@ func (ctx *cbcAEAD) computeAuthTag(aad, nonce, ciphertext []byte) []byte {
+ // resize ensures the the given slice has a capacity of at least n bytes.
+ // If the capacity of the slice is less than n, a new slice is allocated
+ // and the existing data will be copied.
+-func resize(in []byte, n int) (head, tail []byte) {
+-	if cap(in) >= n {
++func resize(in []byte, n uint64) (head, tail []byte) {
++	if uint64(cap(in)) >= n {
+ 		head = in[:n]
+ 	} else {
+ 		head = make([]byte, n)
+@@ -168,7 +168,7 @@ func resize(in []byte, n int) (head, tail []byte) {
+ // Apply padding
+ func padBuffer(buffer []byte, blockSize int) []byte {
+ 	missing := blockSize - (len(buffer) % blockSize)
+-	ret, out := resize(buffer, len(buffer)+missing)
++	ret, out := resize(buffer, uint64(len(buffer))+uint64(missing))
+ 	padding := bytes.Repeat([]byte{byte(missing)}, missing)
+ 	copy(out, padding)
+ 	return ret
+diff --git a/vendor/gopkg.in/square/go-jose.v1/cipher/concat_kdf.go b/vendor/gopkg.in/square/go-jose.v1/cipher/concat_kdf.go
+index cbb5f7b..f62c3bd 100644
+--- a/vendor/gopkg.in/square/go-jose.v1/cipher/concat_kdf.go
++++ b/vendor/gopkg.in/square/go-jose.v1/cipher/concat_kdf.go
+@@ -32,7 +32,7 @@ type concatKDF struct {
+ 
+ // NewConcatKDF builds a KDF reader based on the given inputs.
+ func NewConcatKDF(hash crypto.Hash, z, algID, ptyUInfo, ptyVInfo, supPubInfo, supPrivInfo []byte) io.Reader {
+-	buffer := make([]byte, len(algID)+len(ptyUInfo)+len(ptyVInfo)+len(supPubInfo)+len(supPrivInfo))
++	buffer := make([]byte, uint64(len(algID))+uint64(len(ptyUInfo))+uint64(len(ptyVInfo))+uint64(len(supPubInfo))+uint64(len(supPrivInfo)))
+ 	n := 0
+ 	n += copy(buffer, algID)
+ 	n += copy(buffer[n:], ptyUInfo)
+diff --git a/vendor/gopkg.in/square/go-jose.v1/cipher/ecdh_es.go b/vendor/gopkg.in/square/go-jose.v1/cipher/ecdh_es.go
+index c6a5a82..c128e32 100644
+--- a/vendor/gopkg.in/square/go-jose.v1/cipher/ecdh_es.go
++++ b/vendor/gopkg.in/square/go-jose.v1/cipher/ecdh_es.go
+@@ -23,7 +23,14 @@ import (
+ )
+ 
+ // DeriveECDHES derives a shared encryption key using ECDH/ConcatKDF as described in JWE/JWA.
++// It is an error to call this function with a private/public key that are not on the same
++// curve. Callers must ensure that the keys are valid before calling this function. Output
++// size may be at most 1<<16 bytes (64 KiB).
+ func DeriveECDHES(alg string, apuData, apvData []byte, priv *ecdsa.PrivateKey, pub *ecdsa.PublicKey, size int) []byte {
++	if size > 1<<16 {
++		panic("ECDH-ES output size too large, must be less than or equal to 1<<16")
++	}
++
+ 	// algId, partyUInfo, partyVInfo inputs must be prefixed with the length
+ 	algID := lengthPrefixed([]byte(alg))
+ 	ptyUInfo := lengthPrefixed(apuData)
+@@ -33,6 +40,10 @@ func DeriveECDHES(alg string, apuData, apvData []byte, priv *ecdsa.PrivateKey, p
+ 	supPubInfo := make([]byte, 4)
+ 	binary.BigEndian.PutUint32(supPubInfo, uint32(size)*8)
+ 
++	if !priv.PublicKey.Curve.IsOnCurve(pub.X, pub.Y) {
++		panic("public key not on same curve as private key")
++	}
++
+ 	z, _ := priv.PublicKey.Curve.ScalarMult(pub.X, pub.Y, priv.D.Bytes())
+ 	reader := NewConcatKDF(crypto.SHA256, z.Bytes(), algID, ptyUInfo, ptyVInfo, supPubInfo, []byte{})
+ 
+diff --git a/vendor/gopkg.in/square/go-jose.v1/crypter.go b/vendor/gopkg.in/square/go-jose.v1/crypter.go
+index f61af2c..b3bdaec 100644
+--- a/vendor/gopkg.in/square/go-jose.v1/crypter.go
++++ b/vendor/gopkg.in/square/go-jose.v1/crypter.go
+@@ -19,6 +19,7 @@ package jose
+ import (
+ 	"crypto/ecdsa"
+ 	"crypto/rsa"
++	"errors"
+ 	"fmt"
+ 	"reflect"
+ )
+@@ -292,10 +293,16 @@ func (ctx *genericEncrypter) EncryptWithAuthData(plaintext, aad []byte) (*JsonWe
+ 	return obj, nil
+ }
+ 
+-// Decrypt and validate the object and return the plaintext.
++// Decrypt and validate the object and return the plaintext. Note that this
++// function does not support multi-recipient, if you desire multi-recipient
++// decryption use DecryptMulti instead.
+ func (obj JsonWebEncryption) Decrypt(decryptionKey interface{}) ([]byte, error) {
+ 	headers := obj.mergedHeaders(nil)
+ 
++	if len(obj.recipients) > 1 {
++		return nil, errors.New("square/go-jose: too many recipients in payload; expecting only one")
++	}
++
+ 	if len(headers.Crit) > 0 {
+ 		return nil, fmt.Errorf("square/go-jose: unsupported crit header")
+ 	}
+@@ -323,7 +330,65 @@ func (obj JsonWebEncryption) Decrypt(decryptionKey interface{}) ([]byte, error)
+ 	authData := obj.computeAuthData()
+ 
+ 	var plaintext []byte
+-	for _, recipient := range obj.recipients {
++	recipient := obj.recipients[0]
++	recipientHeaders := obj.mergedHeaders(&recipient)
++
++	cek, err := decrypter.decryptKey(recipientHeaders, &recipient, generator)
++	if err == nil {
++		// Found a valid CEK -- let's try to decrypt.
++		plaintext, err = cipher.decrypt(cek, authData, parts)
++	}
++
++	if plaintext == nil {
++		return nil, ErrCryptoFailure
++	}
++
++	// The "zip" header parameter may only be present in the protected header.
++	if obj.protected.Zip != "" {
++		plaintext, err = decompress(obj.protected.Zip, plaintext)
++	}
++
++	return plaintext, err
++}
++
++// DecryptMulti decrypts and validates the object and returns the plaintexts,
++// with support for multiple recipients. It returns the index of the recipient
++// for which the decryption was successful, the merged headers for that recipient,
++// and the plaintext.
++func (obj JsonWebEncryption) DecryptMulti(decryptionKey interface{}) (int, JoseHeader, []byte, error) {
++	globalHeaders := obj.mergedHeaders(nil)
++
++	if len(globalHeaders.Crit) > 0 {
++		return -1, JoseHeader{}, nil, fmt.Errorf("square/go-jose: unsupported crit header")
++	}
++
++	decrypter, err := newDecrypter(decryptionKey)
++	if err != nil {
++		return -1, JoseHeader{}, nil, err
++	}
++
++	cipher := getContentCipher(globalHeaders.Enc)
++	if cipher == nil {
++		return -1, JoseHeader{}, nil, fmt.Errorf("square/go-jose: unsupported enc value '%s'", string(globalHeaders.Enc))
++	}
++
++	generator := randomKeyGenerator{
++		size: cipher.keySize(),
++	}
++
++	parts := &aeadParts{
++		iv:         obj.iv,
++		ciphertext: obj.ciphertext,
++		tag:        obj.tag,
++	}
++
++	authData := obj.computeAuthData()
++
++	index := -1
++	var plaintext []byte
++	var headers rawHeader
++
++	for i, recipient := range obj.recipients {
+ 		recipientHeaders := obj.mergedHeaders(&recipient)
+ 
+ 		cek, err := decrypter.decryptKey(recipientHeaders, &recipient, generator)
+@@ -331,19 +396,21 @@ func (obj JsonWebEncryption) Decrypt(decryptionKey interface{}) ([]byte, error)
+ 			// Found a valid CEK -- let's try to decrypt.
+ 			plaintext, err = cipher.decrypt(cek, authData, parts)
+ 			if err == nil {
++				index = i
++				headers = recipientHeaders
+ 				break
+ 			}
+ 		}
+ 	}
+ 
+-	if plaintext == nil {
+-		return nil, ErrCryptoFailure
++	if plaintext == nil || err != nil {
++		return -1, JoseHeader{}, nil, ErrCryptoFailure
+ 	}
+ 
+-	// The "zip" header paramter may only be present in the protected header.
++	// The "zip" header parameter may only be present in the protected header.
+ 	if obj.protected.Zip != "" {
+ 		plaintext, err = decompress(obj.protected.Zip, plaintext)
+ 	}
+ 
+-	return plaintext, err
++	return index, headers.sanitized(), plaintext, err
+ }
+diff --git a/vendor/gopkg.in/square/go-jose.v1/encoding.go b/vendor/gopkg.in/square/go-jose.v1/encoding.go
+index 3e2ac0a..dde0a42 100644
+--- a/vendor/gopkg.in/square/go-jose.v1/encoding.go
++++ b/vendor/gopkg.in/square/go-jose.v1/encoding.go
+@@ -25,6 +25,8 @@ import (
+ 	"math/big"
+ 	"regexp"
+ 	"strings"
++
++	"gopkg.in/square/go-jose.v1/json"
+ )
+ 
+ var stripWhitespaceRegex = regexp.MustCompile("\\s")
+@@ -45,7 +47,7 @@ func base64URLDecode(data string) ([]byte, error) {
+ // Helper function to serialize known-good objects.
+ // Precondition: value is not a nil pointer.
+ func mustSerializeJSON(value interface{}) []byte {
+-	out, err := MarshalJSON(value)
++	out, err := json.Marshal(value)
+ 	if err != nil {
+ 		panic(err)
+ 	}
+@@ -146,12 +148,12 @@ func newBufferFromInt(num uint64) *byteBuffer {
+ }
+ 
+ func (b *byteBuffer) MarshalJSON() ([]byte, error) {
+-	return MarshalJSON(b.base64())
++	return json.Marshal(b.base64())
+ }
+ 
+ func (b *byteBuffer) UnmarshalJSON(data []byte) error {
+ 	var encoded string
+-	err := UnmarshalJSON(data, &encoded)
++	err := json.Unmarshal(data, &encoded)
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/vendor/gopkg.in/square/go-jose.v1/jose-util/README.md b/vendor/gopkg.in/square/go-jose.v1/jose-util/README.md
+new file mode 100644
+index 0000000..b9da848
+--- /dev/null
++++ b/vendor/gopkg.in/square/go-jose.v1/jose-util/README.md
+@@ -0,0 +1,59 @@
++# JOSE CLI
++
++The `jose-util` command line utility allows for encryption, decryption, signing
++and verification of JOSE messages. Its main purpose is to facilitate dealing
++with JOSE messages when testing or debugging.
++
++## Usage
++
++The utility includes the subcommands `encrypt`, `decrypt`, `sign`, `verify` and
++`expand`. Examples for each command can be found below.
++
++Algorithms are selected via the `--alg` and `--enc` flags, which influence the
++`alg` and `enc` headers in respectively. For JWE, `--alg` specifies the key
++managment algorithm (e.g. `RSA-OAEP`) and `--enc` specifies the content
++encryption algorithm (e.g. `A128GCM`). For JWS, `--alg` specifies the
++signature algorithm (e.g. `PS256`).
++
++Input and output files can be specified via the `--in` and `--out` flags.
++Either flag can be omitted, in which case `jose-util` uses stdin/stdout for
++input/output respectively. By default each command will output a compact
++message, but it's possible to get the full serialization by supplying the
++`--full` flag.
++
++Keys are specified via the `--key` flag. Supported key types are naked RSA/EC
++keys and X.509 certificates with embedded RSA/EC keys. Keys must be in PEM
++or DER formats.
++
++## Examples
++
++### Encrypt
++
++Takes a plaintext as input, encrypts, and prints the encrypted message.
++
++    echo 'test message' | jose-util encrypt --key public-key.pem --alg RSA-OAEP --enc A128GCM
++
++### Decrypt
++
++Takes an encrypted message (JWE) as input, decrypts, and prints the plaintext.
++
++    jose-util decrypt --key private-key.pem
++
++### Sign
++
++Takes a payload as input, signs it, and prints the signed message with the embedded payload.
++
++    jose-util sign --key private-key.pem --alg PS256
++
++### Verify
++
++Reads a signed message (JWS), verifies it, and extracts the payload.
++
++    jose-util verify --key public-key.pem
++
++### Expand
++
++Expands a compact message to the full serialization format.
++
++    jose-util expand --format JWE   # Expands a compact JWE to full format
++    jose-util expand --format JWS   # Expands a compact JWS to full format
+diff --git a/vendor/gopkg.in/square/go-jose.v1/jose-util/jose-util.t b/vendor/gopkg.in/square/go-jose.v1/jose-util/jose-util.t
+new file mode 100644
+index 0000000..c0d747b
+--- /dev/null
++++ b/vendor/gopkg.in/square/go-jose.v1/jose-util/jose-util.t
+@@ -0,0 +1,94 @@
++Set up test keys.
++
++  $ cat > rsa.pub <<EOF
++  > -----BEGIN PUBLIC KEY-----
++  > MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAslWybuiNYR7uOgKuvaBw
++  > qVk8saEutKhOAaW+3hWF65gJei+ZV8QFfYDxs9ZaRZlWAUMtncQPnw7ZQlXO9ogN
++  > 5cMcN50C6qMOOZzghK7danalhF5lUETC4Hk3Eisbi/PR3IfVyXaRmqL6X66MKj/J
++  > AKyD9NFIDVy52K8A198Jojnrw2+XXQW72U68fZtvlyl/BTBWQ9Re5JSTpEcVmpCR
++  > 8FrFc0RPMBm+G5dRs08vvhZNiTT2JACO5V+J5ZrgP3s5hnGFcQFZgDnXLInDUdoi
++  > 1MuCjaAU0ta8/08pHMijNix5kFofdPEB954MiZ9k4kQ5/utt02I9x2ssHqw71ojj
++  > vwIDAQAB
++  > -----END PUBLIC KEY-----
++  > EOF
++
++  $ cat > rsa.key <<EOF
++  > -----BEGIN RSA PRIVATE KEY-----
++  > MIIEogIBAAKCAQEAslWybuiNYR7uOgKuvaBwqVk8saEutKhOAaW+3hWF65gJei+Z
++  > V8QFfYDxs9ZaRZlWAUMtncQPnw7ZQlXO9ogN5cMcN50C6qMOOZzghK7danalhF5l
++  > UETC4Hk3Eisbi/PR3IfVyXaRmqL6X66MKj/JAKyD9NFIDVy52K8A198Jojnrw2+X
++  > XQW72U68fZtvlyl/BTBWQ9Re5JSTpEcVmpCR8FrFc0RPMBm+G5dRs08vvhZNiTT2
++  > JACO5V+J5ZrgP3s5hnGFcQFZgDnXLInDUdoi1MuCjaAU0ta8/08pHMijNix5kFof
++  > dPEB954MiZ9k4kQ5/utt02I9x2ssHqw71ojjvwIDAQABAoIBABrYDYDmXom1BzUS
++  > PE1s/ihvt1QhqA8nmn5i/aUeZkc9XofW7GUqq4zlwPxKEtKRL0IHY7Fw1s0hhhCX
++  > LA0uE7F3OiMg7lR1cOm5NI6kZ83jyCxxrRx1DUSO2nxQotfhPsDMbaDiyS4WxEts
++  > 0cp2SYJhdYd/jTH9uDfmt+DGwQN7Jixio1Dj3vwB7krDY+mdre4SFY7Gbk9VxkDg
++  > LgCLMoq52m+wYufP8CTgpKFpMb2/yJrbLhuJxYZrJ3qd/oYo/91k6v7xlBKEOkwD
++  > 2veGk9Dqi8YPNxaRktTEjnZb6ybhezat93+VVxq4Oem3wMwou1SfXrSUKtgM/p2H
++  > vfw/76ECgYEA2fNL9tC8u9M0wjA+kvvtDG96qO6O66Hksssy6RWInD+Iqk3MtHQt
++  > LeoCjvX+zERqwOb6SI6empk5pZ9E3/9vJ0dBqkxx3nqn4M/nRWnExGgngJsL959t
++  > f50cdxva8y1RjNhT4kCwTrupX/TP8lAG8SfG1Alo2VFR8iWd8hDQcTECgYEA0Xfj
++  > EgqAsVh4U0s3lFxKjOepEyp0G1Imty5J16SvcOEAD1Mrmz94aSSp0bYhXNVdbf7n
++  > Rk77htWC7SE29fGjOzZRS76wxj/SJHF+rktHB2Zt23k1jBeZ4uLMPMnGLY/BJ099
++  > 5DTGo0yU0rrPbyXosx+ukfQLAHFuggX4RNeM5+8CgYB7M1J/hGMLcUpjcs4MXCgV
++  > XXbiw2c6v1r9zmtK4odEe42PZ0cNwpY/XAZyNZAAe7Q0stxL44K4NWEmxC80x7lX
++  > ZKozz96WOpNnO16qGC3IMHAT/JD5Or+04WTT14Ue7UEp8qcIQDTpbJ9DxKk/eglS
++  > jH+SIHeKULOXw7fSu7p4IQKBgBnyVchIUMSnBtCagpn4DKwDjif3nEY+GNmb/D2g
++  > ArNiy5UaYk5qwEmV5ws5GkzbiSU07AUDh5ieHgetk5dHhUayZcOSLWeBRFCLVnvU
++  > i0nZYEZNb1qZGdDG8zGcdNXz9qMd76Qy/WAA/nZT+Zn1AiweAovFxQ8a/etRPf2Z
++  > DbU1AoGAHpCgP7B/4GTBe49H0AQueQHBn4RIkgqMy9xiMeR+U+U0vaY0TlfLhnX+
++  > 5PkNfkPXohXlfL7pxwZNYa6FZhCAubzvhKCdUASivkoGaIEk6g1VTVYS/eDVQ4CA
++  > slfl+elXtLq/l1kQ8C14jlHrQzSXx4PQvjDEnAmaHSJNz4mP9Fg=
++  > -----END RSA PRIVATE KEY-----
++  > EOF
++
++  $ cat > ec.pub <<EOF
++  > -----BEGIN PUBLIC KEY-----
++  > MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAE9yoUEAgxTd9svwe9oPqjhcP+f2jcdTL2
++  > Wq8Aw2v9ht1dBy00tFRPNrCxFCkvMcJFhSPoDUV5NL7zfh3/psiSNYziGPrWEJYf
++  > gmYihjSeoOf0ru1erpBrTflImPrMftCy
++  > -----END PUBLIC KEY-----
++  > EOF
++
++  $ cat > ec.key <<EOF
++  > -----BEGIN EC PRIVATE KEY-----
++  > MIGkAgEBBDDvoj/bM1HokUjYWO/IDFs26Jo0GIFtU3tMQQu7ZabKscDMK3dZA0mK
++  > v97ij7BBFbCgBwYFK4EEACKhZANiAAT3KhQQCDFN32y/B72g+qOFw/5/aNx1MvZa
++  > rwDDa/2G3V0HLTS0VE82sLEUKS8xwkWFI+gNRXk0vvN+Hf+myJI1jOIY+tYQlh+C
++  > ZiKGNJ6g5/Su7V6ukGtN+UiY+sx+0LI=
++  > -----END EC PRIVATE KEY-----
++  > EOF
++
++Encrypt and then decrypt a test message (RSA).
++
++  $ echo "Lorem ipsum dolor sit amet" | 
++  > jose-util encrypt --alg RSA-OAEP --enc A128GCM --key rsa.pub |
++  > jose-util decrypt --key rsa.key
++  Lorem ipsum dolor sit amet
++
++Encrypt and then decrypt a test message (EC).
++
++  $ echo "Lorem ipsum dolor sit amet" | 
++  > jose-util encrypt --alg ECDH-ES+A128KW --enc A128GCM --key ec.pub |
++  > jose-util decrypt --key ec.key
++  Lorem ipsum dolor sit amet
++
++Sign and verify a test message (RSA).
++
++  $ echo "Lorem ipsum dolor sit amet" | 
++  > jose-util sign --alg PS256 --key rsa.key |
++  > jose-util verify --key rsa.pub
++  Lorem ipsum dolor sit amet
++
++Sign and verify a test message (EC).
++
++  $ echo "Lorem ipsum dolor sit amet" | 
++  > jose-util sign --alg ES384 --key ec.key |
++  > jose-util verify --key ec.pub
++  Lorem ipsum dolor sit amet
++
++Expand a compact message to full format.
++
++  $ echo "eyJhbGciOiJFUzM4NCJ9.TG9yZW0gaXBzdW0gZG9sb3Igc2l0IGFtZXQK.QPU35XY913Im7ZEaN2yHykfbtPqjHZvYp-lV8OcTAJZs67bJFSdTSkQhQWE9ch6tvYrj_7py6HKaWVFLll_s_Rm6bmwq3JszsHrIvFFm1NydruYHhvAnx7rjYiqwOu0W" |
++  > jose-util expand --format JWS
++  {"payload":"TG9yZW0gaXBzdW0gZG9sb3Igc2l0IGFtZXQK","protected":"eyJhbGciOiJFUzM4NCJ9","signature":"QPU35XY913Im7ZEaN2yHykfbtPqjHZvYp-lV8OcTAJZs67bJFSdTSkQhQWE9ch6tvYrj_7py6HKaWVFLll_s_Rm6bmwq3JszsHrIvFFm1NydruYHhvAnx7rjYiqwOu0W"}
+diff --git a/vendor/gopkg.in/square/go-jose.v1/jose-util/main.go b/vendor/gopkg.in/square/go-jose.v1/jose-util/main.go
+new file mode 100644
+index 0000000..7ae93ee
+--- /dev/null
++++ b/vendor/gopkg.in/square/go-jose.v1/jose-util/main.go
+@@ -0,0 +1,189 @@
++/*-
++ * Copyright 2014 Square Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package main
++
++import (
++	"fmt"
++	"io/ioutil"
++	"os"
++
++	"gopkg.in/alecthomas/kingpin.v2"
++	"gopkg.in/square/go-jose.v1"
++)
++
++var (
++	app = kingpin.New("jose-util", "A command-line utility for dealing with JOSE objects.")
++
++	keyFile = app.Flag("key", "Path to key file (PEM or DER-encoded)").ExistingFile()
++	inFile  = app.Flag("in", "Path to input file (stdin if missing)").ExistingFile()
++	outFile = app.Flag("out", "Path to output file (stdout if missing)").ExistingFile()
++
++	encryptCommand = app.Command("encrypt", "Encrypt a plaintext, output ciphertext.")
++	algFlag        = encryptCommand.Flag("alg", "Key management algorithm (e.g. RSA-OAEP)").Required().String()
++	encFlag        = encryptCommand.Flag("enc", "Content encryption algorithm (e.g. A128GCM)").Required().String()
++
++	decryptCommand = app.Command("decrypt", "Decrypt a ciphertext, output plaintext.")
++
++	signCommand = app.Command("sign", "Sign a payload, output signed message.")
++	sigAlgFlag  = signCommand.Flag("alg", "Key management algorithm (e.g. RSA-OAEP)").Required().String()
++
++	verifyCommand = app.Command("verify", "Verify a signed message, output payload.")
++
++	expandCommand = app.Command("expand", "Expand JOSE object to full serialization format.")
++	formatFlag    = expandCommand.Flag("format", "Type of message to expand (JWS or JWE, defaults to JWE)").String()
++
++	full = app.Flag("full", "Use full serialization format (instead of compact)").Bool()
++)
++
++func main() {
++	app.Version("v1")
++
++	command := kingpin.MustParse(app.Parse(os.Args[1:]))
++
++	var keyBytes []byte
++	var err error
++	if command != "expand" {
++		keyBytes, err = ioutil.ReadFile(*keyFile)
++		exitOnError(err, "unable to read key file")
++	}
++
++	switch command {
++	case "encrypt":
++		pub, err := jose.LoadPublicKey(keyBytes)
++		exitOnError(err, "unable to read public key")
++
++		alg := jose.KeyAlgorithm(*algFlag)
++		enc := jose.ContentEncryption(*encFlag)
++
++		crypter, err := jose.NewEncrypter(alg, enc, pub)
++		exitOnError(err, "unable to instantiate encrypter")
++
++		obj, err := crypter.Encrypt(readInput(*inFile))
++		exitOnError(err, "unable to encrypt")
++
++		var msg string
++		if *full {
++			msg = obj.FullSerialize()
++		} else {
++			msg, err = obj.CompactSerialize()
++			exitOnError(err, "unable to serialize message")
++		}
++
++		writeOutput(*outFile, []byte(msg))
++	case "decrypt":
++		priv, err := jose.LoadPrivateKey(keyBytes)
++		exitOnError(err, "unable to read private key")
++
++		obj, err := jose.ParseEncrypted(string(readInput(*inFile)))
++		exitOnError(err, "unable to parse message")
++
++		plaintext, err := obj.Decrypt(priv)
++		exitOnError(err, "unable to decrypt message")
++
++		writeOutput(*outFile, plaintext)
++	case "sign":
++		signingKey, err := jose.LoadPrivateKey(keyBytes)
++		exitOnError(err, "unable to read private key")
++
++		alg := jose.SignatureAlgorithm(*sigAlgFlag)
++		signer, err := jose.NewSigner(alg, signingKey)
++		exitOnError(err, "unable to make signer")
++
++		obj, err := signer.Sign(readInput(*inFile))
++		exitOnError(err, "unable to sign")
++
++		var msg string
++		if *full {
++			msg = obj.FullSerialize()
++		} else {
++			msg, err = obj.CompactSerialize()
++			exitOnError(err, "unable to serialize message")
++		}
++
++		writeOutput(*outFile, []byte(msg))
++	case "verify":
++		verificationKey, err := jose.LoadPublicKey(keyBytes)
++		exitOnError(err, "unable to read private key")
++
++		obj, err := jose.ParseSigned(string(readInput(*inFile)))
++		exitOnError(err, "unable to parse message")
++
++		plaintext, err := obj.Verify(verificationKey)
++		exitOnError(err, "invalid signature")
++
++		writeOutput(*outFile, plaintext)
++	case "expand":
++		input := string(readInput(*inFile))
++
++		var serialized string
++		var err error
++		switch *formatFlag {
++		case "", "JWE":
++			var jwe *jose.JsonWebEncryption
++			jwe, err = jose.ParseEncrypted(input)
++			if err == nil {
++				serialized = jwe.FullSerialize()
++			}
++		case "JWS":
++			var jws *jose.JsonWebSignature
++			jws, err = jose.ParseSigned(input)
++			if err == nil {
++				serialized = jws.FullSerialize()
++			}
++		}
++
++		exitOnError(err, "unable to expand message")
++		writeOutput(*outFile, []byte(serialized))
++		writeOutput(*outFile, []byte("\n"))
++	}
++}
++
++// Exit and print error message if we encountered a problem
++func exitOnError(err error, msg string) {
++	if err != nil {
++		fmt.Fprintf(os.Stderr, "%s: %s\n", msg, err)
++		os.Exit(1)
++	}
++}
++
++// Read input from file or stdin
++func readInput(path string) []byte {
++	var bytes []byte
++	var err error
++
++	if path != "" {
++		bytes, err = ioutil.ReadFile(path)
++	} else {
++		bytes, err = ioutil.ReadAll(os.Stdin)
++	}
++
++	exitOnError(err, "unable to read input")
++	return bytes
++}
++
++// Write output to file or stdin
++func writeOutput(path string, data []byte) {
++	var err error
++
++	if path != "" {
++		err = ioutil.WriteFile(path, data, 0644)
++	} else {
++		_, err = os.Stdout.Write(data)
++	}
++
++	exitOnError(err, "unable to write output")
++}
+diff --git a/vendor/gopkg.in/square/go-jose.v1/jwe.go b/vendor/gopkg.in/square/go-jose.v1/jwe.go
+index b88cb79..ee19ea1 100644
+--- a/vendor/gopkg.in/square/go-jose.v1/jwe.go
++++ b/vendor/gopkg.in/square/go-jose.v1/jwe.go
+@@ -19,6 +19,8 @@ package jose
+ import (
+ 	"fmt"
+ 	"strings"
++
++	"gopkg.in/square/go-jose.v1/json"
+ )
+ 
+ // rawJsonWebEncryption represents a raw JWE JSON object. Used for parsing/serializing.
+@@ -83,10 +85,12 @@ func (obj JsonWebEncryption) mergedHeaders(recipient *recipientInfo) rawHeader {
+ func (obj JsonWebEncryption) computeAuthData() []byte {
+ 	var protected string
+ 
+-	if obj.original != nil {
++	if obj.original != nil && obj.original.Protected != nil {
+ 		protected = obj.original.Protected.base64()
+-	} else {
++	} else if obj.protected != nil {
+ 		protected = base64URLEncode(mustSerializeJSON((obj.protected)))
++	} else {
++		protected = ""
+ 	}
+ 
+ 	output := []byte(protected)
+@@ -111,7 +115,7 @@ func ParseEncrypted(input string) (*JsonWebEncryption, error) {
+ // parseEncryptedFull parses a message in compact format.
+ func parseEncryptedFull(input string) (*JsonWebEncryption, error) {
+ 	var parsed rawJsonWebEncryption
+-	err := UnmarshalJSON([]byte(input), &parsed)
++	err := json.Unmarshal([]byte(input), &parsed)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -133,7 +137,7 @@ func (parsed *rawJsonWebEncryption) sanitized() (*JsonWebEncryption, error) {
+ 	}
+ 
+ 	if parsed.Protected != nil && len(parsed.Protected.bytes()) > 0 {
+-		err := UnmarshalJSON(parsed.Protected.bytes(), &obj.protected)
++		err := json.Unmarshal(parsed.Protected.bytes(), &obj.protected)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("square/go-jose: invalid protected header: %s, %s", err, parsed.Protected.base64())
+ 		}
+diff --git a/vendor/gopkg.in/square/go-jose.v1/jwk.go b/vendor/gopkg.in/square/go-jose.v1/jwk.go
+index 2fa38a2..e0d5c12 100644
+--- a/vendor/gopkg.in/square/go-jose.v1/jwk.go
++++ b/vendor/gopkg.in/square/go-jose.v1/jwk.go
+@@ -21,10 +21,15 @@ import (
+ 	"crypto/ecdsa"
+ 	"crypto/elliptic"
+ 	"crypto/rsa"
++	"crypto/x509"
++	"encoding/base64"
++	"errors"
+ 	"fmt"
+ 	"math/big"
+ 	"reflect"
+ 	"strings"
++
++	"gopkg.in/square/go-jose.v1/json"
+ )
+ 
+ // rawJsonWebKey represents a public or private key in JWK format, used for parsing/serializing.
+@@ -49,14 +54,17 @@ type rawJsonWebKey struct {
+ 	Dp *byteBuffer `json:"dp,omitempty"`
+ 	Dq *byteBuffer `json:"dq,omitempty"`
+ 	Qi *byteBuffer `json:"qi,omitempty"`
++	// Certificates
++	X5c []string `json:"x5c,omitempty"`
+ }
+ 
+ // JsonWebKey represents a public or private key in JWK format.
+ type JsonWebKey struct {
+-	Key       interface{}
+-	KeyID     string
+-	Algorithm string
+-	Use       string
++	Key          interface{}
++	Certificates []*x509.Certificate
++	KeyID        string
++	Algorithm    string
++	Use          string
+ }
+ 
+ // MarshalJSON serializes the given key to its JSON representation.
+@@ -87,13 +95,17 @@ func (k JsonWebKey) MarshalJSON() ([]byte, error) {
+ 	raw.Alg = k.Algorithm
+ 	raw.Use = k.Use
+ 
+-	return MarshalJSON(raw)
++	for _, cert := range k.Certificates {
++		raw.X5c = append(raw.X5c, base64.StdEncoding.EncodeToString(cert.Raw))
++	}
++
++	return json.Marshal(raw)
+ }
+ 
+ // UnmarshalJSON reads a key from its JSON representation.
+ func (k *JsonWebKey) UnmarshalJSON(data []byte) (err error) {
+ 	var raw rawJsonWebKey
+-	err = UnmarshalJSON(data, &raw)
++	err = json.Unmarshal(data, &raw)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -115,12 +127,25 @@ func (k *JsonWebKey) UnmarshalJSON(data []byte) (err error) {
+ 	case "oct":
+ 		key, err = raw.symmetricKey()
+ 	default:
+-		err = fmt.Errorf("square/go-jose: unkown json web key type '%s'", raw.Kty)
++		err = fmt.Errorf("square/go-jose: unknown json web key type '%s'", raw.Kty)
+ 	}
+ 
+ 	if err == nil {
+ 		*k = JsonWebKey{Key: key, KeyID: raw.Kid, Algorithm: raw.Alg, Use: raw.Use}
+ 	}
++
++	k.Certificates = make([]*x509.Certificate, len(raw.X5c))
++	for i, cert := range raw.X5c {
++		raw, err := base64.StdEncoding.DecodeString(cert)
++		if err != nil {
++			return err
++		}
++		k.Certificates[i], err = x509.ParseCertificate(raw)
++		if err != nil {
++			return err
++		}
++	}
++
+ 	return
+ }
+ 
+@@ -154,6 +179,10 @@ func ecThumbprintInput(curve elliptic.Curve, x, y *big.Int) (string, error) {
+ 		return "", err
+ 	}
+ 
++	if len(x.Bytes()) > coordLength || len(y.Bytes()) > coordLength {
++		return "", errors.New("square/go-jose: invalid elliptic key (too large)")
++	}
++
+ 	return fmt.Sprintf(ecThumbprintTemplate, crv,
+ 		newFixedSizeBuffer(x.Bytes(), coordLength).base64(),
+ 		newFixedSizeBuffer(y.Bytes(), coordLength).base64()), nil
+@@ -180,7 +209,7 @@ func (k *JsonWebKey) Thumbprint(hash crypto.Hash) ([]byte, error) {
+ 	case *rsa.PrivateKey:
+ 		input, err = rsaThumbprintInput(key.N, key.E)
+ 	default:
+-		return nil, fmt.Errorf("square/go-jose: unkown key type '%s'", reflect.TypeOf(key))
++		return nil, fmt.Errorf("square/go-jose: unknown key type '%s'", reflect.TypeOf(key))
+ 	}
+ 
+ 	if err != nil {
+@@ -192,6 +221,44 @@ func (k *JsonWebKey) Thumbprint(hash crypto.Hash) ([]byte, error) {
+ 	return h.Sum(nil), nil
+ }
+ 
++// IsPublic returns true if the JWK represents a public key (not symmetric, not private).
++func (k *JsonWebKey) IsPublic() bool {
++	switch k.Key.(type) {
++	case *ecdsa.PublicKey, *rsa.PublicKey:
++		return true
++	default:
++		return false
++	}
++}
++
++// Valid checks that the key contains the expected parameters.
++func (k *JsonWebKey) Valid() bool {
++	if k.Key == nil {
++		return false
++	}
++	switch key := k.Key.(type) {
++	case *ecdsa.PublicKey:
++		if key.Curve == nil || key.X == nil || key.Y == nil {
++			return false
++		}
++	case *ecdsa.PrivateKey:
++		if key.Curve == nil || key.X == nil || key.Y == nil || key.D == nil {
++			return false
++		}
++	case *rsa.PublicKey:
++		if key.N == nil || key.E == 0 {
++			return false
++		}
++	case *rsa.PrivateKey:
++		if key.N == nil || key.E == 0 || key.D == nil || len(key.Primes) < 2 {
++			return false
++		}
++	default:
++		return false
++	}
++	return true
++}
++
+ func (key rawJsonWebKey) rsaPublicKey() (*rsa.PublicKey, error) {
+ 	if key.N == nil || key.E == nil {
+ 		return nil, fmt.Errorf("square/go-jose: invalid RSA key, missing n/e values")
+@@ -225,13 +292,20 @@ func (key rawJsonWebKey) ecPublicKey() (*ecdsa.PublicKey, error) {
+ 	}
+ 
+ 	if key.X == nil || key.Y == nil {
+-		return nil, fmt.Errorf("square/go-jose: invalid EC key, missing x/y values")
++		return nil, errors.New("square/go-jose: invalid EC key, missing x/y values")
++	}
++
++	x := key.X.bigInt()
++	y := key.Y.bigInt()
++
++	if !curve.IsOnCurve(x, y) {
++		return nil, errors.New("square/go-jose: invalid EC key, X/Y are not on declared curve")
+ 	}
+ 
+ 	return &ecdsa.PublicKey{
+ 		Curve: curve,
+-		X:     key.X.bigInt(),
+-		Y:     key.Y.bigInt(),
++		X:     x,
++		Y:     y,
+ 	}, nil
+ }
+ 
+@@ -340,11 +414,18 @@ func (key rawJsonWebKey) ecPrivateKey() (*ecdsa.PrivateKey, error) {
+ 		return nil, fmt.Errorf("square/go-jose: invalid EC private key, missing x/y/d values")
+ 	}
+ 
++	x := key.X.bigInt()
++	y := key.Y.bigInt()
++
++	if !curve.IsOnCurve(x, y) {
++		return nil, errors.New("square/go-jose: invalid EC key, X/Y are not on declared curve")
++	}
++
+ 	return &ecdsa.PrivateKey{
+ 		PublicKey: ecdsa.PublicKey{
+ 			Curve: curve,
+-			X:     key.X.bigInt(),
+-			Y:     key.Y.bigInt(),
++			X:     x,
++			Y:     y,
+ 		},
+ 		D: key.D.bigInt(),
+ 	}, nil
+diff --git a/vendor/gopkg.in/square/go-jose.v1/jws.go b/vendor/gopkg.in/square/go-jose.v1/jws.go
+index 87173c9..04a2a15 100644
+--- a/vendor/gopkg.in/square/go-jose.v1/jws.go
++++ b/vendor/gopkg.in/square/go-jose.v1/jws.go
+@@ -17,8 +17,11 @@
+ package jose
+ 
+ import (
++	"errors"
+ 	"fmt"
+ 	"strings"
++
++	"gopkg.in/square/go-jose.v1/json"
+ )
+ 
+ // rawJsonWebSignature represents a raw JWS JSON object. Used for parsing/serializing.
+@@ -39,7 +42,10 @@ type rawSignatureInfo struct {
+ 
+ // JsonWebSignature represents a signed JWS object after parsing.
+ type JsonWebSignature struct {
+-	payload    []byte
++	payload []byte
++	// Signatures attached to this object (may be more than one for multi-sig).
++	// Be careful about accessing these directly, prefer to use Verify() or
++	// VerifyMulti() to ensure that the data you're getting is verified.
+ 	Signatures []Signature
+ }
+ 
+@@ -56,7 +62,7 @@ type Signature struct {
+ 	original  *rawSignatureInfo
+ }
+ 
+-// ParseSigned parses an encrypted message in compact or full serialization format.
++// ParseSigned parses a signed message in compact or full serialization format.
+ func ParseSigned(input string) (*JsonWebSignature, error) {
+ 	input = stripWhitespace(input)
+ 	if strings.HasPrefix(input, "{") {
+@@ -94,7 +100,7 @@ func (obj JsonWebSignature) computeAuthData(signature *Signature) []byte {
+ // parseSignedFull parses a message in full format.
+ func parseSignedFull(input string) (*JsonWebSignature, error) {
+ 	var parsed rawJsonWebSignature
+-	err := UnmarshalJSON([]byte(input), &parsed)
++	err := json.Unmarshal([]byte(input), &parsed)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -118,12 +124,13 @@ func (parsed *rawJsonWebSignature) sanitized() (*JsonWebSignature, error) {
+ 		signature := Signature{}
+ 		if parsed.Protected != nil && len(parsed.Protected.bytes()) > 0 {
+ 			signature.protected = &rawHeader{}
+-			err := UnmarshalJSON(parsed.Protected.bytes(), signature.protected)
++			err := json.Unmarshal(parsed.Protected.bytes(), signature.protected)
+ 			if err != nil {
+ 				return nil, err
+ 			}
+ 		}
+ 
++		// Check that there is not a nonce in the unprotected header
+ 		if parsed.Header != nil && parsed.Header.Nonce != "" {
+ 			return nil, ErrUnprotectedNonce
+ 		}
+@@ -146,13 +153,20 @@ func (parsed *rawJsonWebSignature) sanitized() (*JsonWebSignature, error) {
+ 		}
+ 
+ 		signature.Header = signature.mergedHeaders().sanitized()
++
++		// As per RFC 7515 Section 4.1.3, only public keys are allowed to be embedded.
++		jwk := signature.Header.JsonWebKey
++		if jwk != nil && (!jwk.Valid() || !jwk.IsPublic()) {
++			return nil, errors.New("square/go-jose: invalid embedded jwk, must be public key")
++		}
++
+ 		obj.Signatures = append(obj.Signatures, signature)
+ 	}
+ 
+ 	for i, sig := range parsed.Signatures {
+ 		if sig.Protected != nil && len(sig.Protected.bytes()) > 0 {
+ 			obj.Signatures[i].protected = &rawHeader{}
+-			err := UnmarshalJSON(sig.Protected.bytes(), obj.Signatures[i].protected)
++			err := json.Unmarshal(sig.Protected.bytes(), obj.Signatures[i].protected)
+ 			if err != nil {
+ 				return nil, err
+ 			}
+@@ -163,14 +177,20 @@ func (parsed *rawJsonWebSignature) sanitized() (*JsonWebSignature, error) {
+ 			return nil, ErrUnprotectedNonce
+ 		}
+ 
++		obj.Signatures[i].Header = obj.Signatures[i].mergedHeaders().sanitized()
+ 		obj.Signatures[i].Signature = sig.Signature.bytes()
+ 
++		// As per RFC 7515 Section 4.1.3, only public keys are allowed to be embedded.
++		jwk := obj.Signatures[i].Header.JsonWebKey
++		if jwk != nil && (!jwk.Valid() || !jwk.IsPublic()) {
++			return nil, errors.New("square/go-jose: invalid embedded jwk, must be public key")
++		}
++
+ 		// Copy value of sig
+ 		original := sig
+ 
+ 		obj.Signatures[i].header = sig.Header
+ 		obj.Signatures[i].original = &original
+-		obj.Signatures[i].Header = obj.Signatures[i].mergedHeaders().sanitized()
+ 	}
+ 
+ 	return obj, nil
+diff --git a/vendor/gopkg.in/square/go-jose.v1/signing.go b/vendor/gopkg.in/square/go-jose.v1/signing.go
+index c6ed2c9..e64f8ab 100644
+--- a/vendor/gopkg.in/square/go-jose.v1/signing.go
++++ b/vendor/gopkg.in/square/go-jose.v1/signing.go
+@@ -19,6 +19,7 @@ package jose
+ import (
+ 	"crypto/ecdsa"
+ 	"crypto/rsa"
++	"errors"
+ 	"fmt"
+ )
+ 
+@@ -186,20 +187,59 @@ func (ctx *genericSigner) SetNonceSource(source NonceSource) {
+ 	ctx.nonceSource = source
+ }
+ 
+-// SetEmbedJwk specifies if the signing key should be embedded in the protected header,
+-// if any. It defaults to 'true'.
++// SetEmbedJwk specifies if the signing key should be embedded in the protected
++// header, if any. It defaults to 'true', though that may change in the future.
++// Note that the use of embedded JWKs in the signature header can be dangerous,
++// as you cannot assume that the key received in a payload is trusted.
+ func (ctx *genericSigner) SetEmbedJwk(embed bool) {
+ 	ctx.embedJwk = embed
+ }
+ 
+ // Verify validates the signature on the object and returns the payload.
++// This function does not support multi-signature, if you desire multi-sig
++// verification use VerifyMulti instead.
++//
++// Be careful when verifying signatures based on embedded JWKs inside the
++// payload header. You cannot assume that the key received in a payload is
++// trusted.
+ func (obj JsonWebSignature) Verify(verificationKey interface{}) ([]byte, error) {
+ 	verifier, err := newVerifier(verificationKey)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	for _, signature := range obj.Signatures {
++	if len(obj.Signatures) > 1 {
++		return nil, errors.New("square/go-jose: too many signatures in payload; expecting only one")
++	}
++
++	signature := obj.Signatures[0]
++	headers := signature.mergedHeaders()
++	if len(headers.Crit) > 0 {
++		// Unsupported crit header
++		return nil, ErrCryptoFailure
++	}
++
++	input := obj.computeAuthData(&signature)
++	alg := SignatureAlgorithm(headers.Alg)
++	err = verifier.verifyPayload(input, signature.Signature, alg)
++	if err == nil {
++		return obj.payload, nil
++	}
++
++	return nil, ErrCryptoFailure
++}
++
++// VerifyMulti validates (one of the multiple) signatures on the object and
++// returns the index of the signature that was verified, along with the signature
++// object and the payload. We return the signature and index to guarantee that
++// callers are getting the verified value.
++func (obj JsonWebSignature) VerifyMulti(verificationKey interface{}) (int, Signature, []byte, error) {
++	verifier, err := newVerifier(verificationKey)
++	if err != nil {
++		return -1, Signature{}, nil, err
++	}
++
++	for i, signature := range obj.Signatures {
+ 		headers := signature.mergedHeaders()
+ 		if len(headers.Crit) > 0 {
+ 			// Unsupported crit header
+@@ -210,9 +250,9 @@ func (obj JsonWebSignature) Verify(verificationKey interface{}) ([]byte, error)
+ 		alg := SignatureAlgorithm(headers.Alg)
+ 		err := verifier.verifyPayload(input, signature.Signature, alg)
+ 		if err == nil {
+-			return obj.payload, nil
++			return i, signature, obj.payload, nil
+ 		}
+ 	}
+ 
+-	return nil, ErrCryptoFailure
++	return -1, Signature{}, nil, ErrCryptoFailure
+ }
+diff --git a/vendor/gopkg.in/square/go-jose.v1/symmetric.go b/vendor/gopkg.in/square/go-jose.v1/symmetric.go
+index 51f8cb3..9feb0a9 100644
+--- a/vendor/gopkg.in/square/go-jose.v1/symmetric.go
++++ b/vendor/gopkg.in/square/go-jose.v1/symmetric.go
+@@ -211,6 +211,10 @@ func (ctx aeadContentCipher) decrypt(key, aad []byte, parts *aeadParts) ([]byte,
+ 		return nil, err
+ 	}
+ 
++	if len(parts.iv) < aead.NonceSize() || len(parts.tag) < ctx.authtagBytes {
++		return nil, ErrCryptoFailure
++	}
++
+ 	return aead.Open(nil, parts.iv, append(parts.ciphertext, parts.tag...), aad)
+ }
+ 
+
+diff --git a/registry/storage/purgeuploads.go b/registry/storage/purgeuploads.go
+index cac9212..5299fa1 100644
+--- a/registry/storage/purgeuploads.go
++++ b/registry/storage/purgeuploads.go
+@@ -70,7 +70,7 @@ func getOutstandingUploads(ctx context.Context, driver storageDriver.StorageDriv
+ 	err = driver.Walk(ctx, root, func(fileInfo storageDriver.FileInfo) error {
+ 		filePath := fileInfo.Path()
+ 		_, file := path.Split(filePath)
+-		if file[0] == '_' {
++		if len(file) > 0 && file[0] == '_' {
+ 			// Reserved directory
+ 			inUploadDir = (file == "_uploads")
+ 
+diff --git a/registry/storage/purgeuploads_test.go b/registry/storage/purgeuploads_test.go
+index 398df2b..b618b50 100644
+--- a/registry/storage/purgeuploads_test.go
++++ b/registry/storage/purgeuploads_test.go
+@@ -53,6 +53,21 @@ func TestPurgeGather(t *testing.T) {
+ 	}
+ }
+ 
++type emptyBasenameDriver struct {
++	driver.StorageDriver
++}
++
++func (d emptyBasenameDriver) Walk(ctx context.Context, root string, walkFn driver.WalkFn) error {
++	return walkFn(driver.FileInfoInternal{FileInfoFields: driver.FileInfoFields{Path: root + "/", IsDir: true}})
++}
++
++func TestPurgeUploadsHandlesEmptyBasename(t *testing.T) {
++	fs := emptyBasenameDriver{StorageDriver: inmemory.New()}
++	if _, errs := getOutstandingUploads(context.Background(), fs); len(errs) != 0 {
++		t.Fatalf("unexpected errors: %v", errs)
++	}
++}
++
+ func TestPurgeNone(t *testing.T) {
+ 	fs, ctx := testUploadFS(t, 10, "test-repo", time.Now())
+ 	oneHourAgo := time.Now().Add(-1 * time.Hour)

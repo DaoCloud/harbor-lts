@@ -24,6 +24,7 @@ DOCKERRMIMAGE=$(DOCKERCMD) rmi
 DOCKERIMAGES=$(DOCKERCMD) images
 IMAGENAMESPACE=goharbor
 BASEIMAGENAMESPACE=goharbor
+PHOTON_IMAGE=photon:4.0
 
 # pushimage
 PUSHSCRIPTPATH=$(MAKEPATH)
@@ -282,7 +283,7 @@ define _build_base
 			cd $(DOCKERFILEPATH)/db && $(DOCKERFILEPATH)/db/rpm_builder.sh && cd - ; \
 			$(DOCKERBUILD) --pull --no-cache -f $(DOCKERFILEPATH)/db/Dockerfile.pg96 -t $(BASEIMAGENAMESPACE)/harbor-db-base:$(BASEIMAGETAG) --label base-build-date=$(TIMESTAMP) . ; \
 		else \
-			$(DOCKERBUILD) -f $(2)/Dockerfile.base -t $(BASEIMAGENAMESPACE)/harbor-$(1)-base:$(BASEIMAGETAG) --label base-build-date=$(TIMESTAMP) . ;\
+			$(DOCKERBUILD) --build-arg photon_image=$(PHOTON_IMAGE) -f $(2)/Dockerfile.base -t $(BASEIMAGENAMESPACE)/harbor-$(1)-base:$(BASEIMAGETAG) --label base-build-date=$(TIMESTAMP) . ;\
 		fi ;\
 		if [ "$(PUSHBASEIMAGE)" = "true" ] ; then \
 			$(PUSHSCRIPTPATH)/$(PUSHSCRIPTNAME) $(BASEIMAGENAMESPACE)/harbor-$(1)-base:$(BASEIMAGETAG) $(REGISTRYUSER) $(REGISTRYPASSWORD) docker.io $(PULL_BASE_FROM_DOCKERHUB) || exit 1; \

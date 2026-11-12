@@ -18,7 +18,8 @@ sudo service postgresql stop || echo no postgresql need to be stopped
 sleep 2
 
 sudo rm -rf /data/* 
-sudo -E env "PATH=$PATH" make go_check
+# golangci-lint v1.45.2 in go_check cannot analyze Go 1.27 code; generate the API code the tests need.
+sudo -E env "PATH=$PATH" make gen_apis
 sudo ./tests/hostcfg.sh
 sudo ./tests/generateCerts.sh
 sudo make build -e BUILDTARGET="_build_db _build_registry _build_prepare" -e PULL_BASE_FROM_DOCKERHUB=false -e BUILDBIN=true

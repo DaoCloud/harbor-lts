@@ -21,6 +21,9 @@ on:
     # PR branches run through pull_request only, so each push runs CI once.
     branches:
     - release-*
+    # A pushed tag (e.g. v2.6.3-2) is a release: PUBLISH pushes its images to ghcr.
+    tags:
+    - 'v*'
     paths-ignore:
     - 'docs/**'
 
@@ -39,11 +42,11 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           sudo docker image prune -af >/dev/null
           df -h /
-      - name: Set up Go 1.18
+      - name: Set up Go 1.27
         uses: actions/setup-go@v5
         with:
            cache: false
-           go-version: 1.18.8
+           go-version: 1.27.3
         id: go
       - uses: actions/checkout@v4
         with:
@@ -110,11 +113,11 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           sudo docker image prune -af >/dev/null
           df -h /
-      - name: Set up Go 1.18
+      - name: Set up Go 1.27
         uses: actions/setup-go@v5
         with:
           cache: false
-          go-version: 1.18.8
+          go-version: 1.27.3
         id: go
       - uses: actions/checkout@v4
         with:
@@ -193,11 +196,11 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           sudo docker image prune -af >/dev/null
           df -h /
-      - name: Set up Go 1.18
+      - name: Set up Go 1.27
         uses: actions/setup-go@v5
         with:
           cache: false
-          go-version: 1.18.8
+          go-version: 1.27.3
         id: go
       - uses: actions/checkout@v4
         with:
@@ -274,11 +277,11 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           sudo docker image prune -af >/dev/null
           df -h /
-      - name: Set up Go 1.18
+      - name: Set up Go 1.27
         uses: actions/setup-go@v5
         with:
           cache: false
-          go-version: 1.18.8
+          go-version: 1.27.3
         id: go
       - uses: actions/checkout@v4
         with:
@@ -320,3 +323,184 @@ jobs:
           cd src/github.com/goharbor/harbor
           bash ./tests/showtime.sh ./tests/ci/distro_installer.sh
           df -h
+      - name: smoke test images
+        run: |
+          cd src/github.com/goharbor/harbor
+          bash ./tests/ci/smoke_images.sh dev-gitaction
+      - name: save images
+        run: |
+          set -e
+          mkdir -p "$RUNNER_TEMP/images"
+          images=""
+          for name in nginx-photon harbor-portal harbor-core harbor-jobservice registry-photon harbor-registryctl chartmuseum-photon trivy-adapter-photon harbor-exporter; do
+            images="$images goharbor/$name:dev-gitaction"
+          done
+          docker image inspect --format '{{index .RepoTags 0}} {{.Id}} {{.Architecture}}' $images | tee "$RUNNER_TEMP/images/images.txt"
+          docker save $images | gzip -1 > "$RUNNER_TEMP/images/harbor-images-amd64.tar.gz"
+          ls -lh "$RUNNER_TEMP/images"
+      - name: scan images
+        run: |
+          set -e
+          for name in nginx-photon harbor-portal harbor-core harbor-jobservice registry-photon harbor-registryctl chartmuseum-photon trivy-adapter-photon harbor-exporter; do
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$RUNNER_TEMP/images:/out" aquasec/trivy:0.76.2 \
+              image --quiet --scanners vuln --severity CRITICAL,HIGH --format json -o /out/trivy-$name.json goharbor/$name:dev-gitaction
+            python3 -c 'import json,sys
+          d=json.load(open(sys.argv[1]));c=h=0
+          for t in d.get("Results") or []:
+              for v in t.get("Vulnerabilities") or []:
+                  c+=v["Severity"]=="CRITICAL";h+=v["Severity"]=="HIGH"
+          print(sys.argv[2],"critical",c,"high",h)' "$RUNNER_TEMP/images/trivy-$name.json" $name | tee -a "$RUNNER_TEMP/images/scan-summary.txt"
+          done
+      - name: upload images
+        uses: actions/upload-artifact@v4
+        with:
+          name: harbor-images-amd64
+          path: ${{ runner.temp }}/images
+          retention-days: 7
+          compression-level: 0
+
+  OFFLINE_ARM64:
+    env:
+      OFFLINE: true
+    runs-on:
+      #- self-hosted
+      - ubuntu-24.04-arm
+    timeout-minutes: 100
+    steps:
+      - name: Set up Go 1.27
+        uses: actions/setup-go@v5
+        with:
+          cache: false
+          go-version: 1.27.3
+        id: go
+      - uses: actions/checkout@v4
+        with:
+          path: src/github.com/goharbor/harbor
+      - name: setup env
+        run: |
+          cd src/github.com/goharbor/harbor
+          pwd
+          docker version
+          go env
+          echo "GOPATH=$(go env GOPATH):$GITHUB_WORKSPACE" >> $GITHUB_ENV
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+          echo "TOKEN_PRIVATE_KEY_PATH=${GITHUB_WORKSPACE}/src/github.com/goharbor/harbor/tests/private_key.pem" >> $GITHUB_ENV
+        shell: bash
+      - name: before_install
+        run: |
+          set -x
+          sudo apt-get update -qq && sudo apt-get install -y -qq python-is-python3 python3-pip
+          cd src/github.com/goharbor/harbor
+          pwd
+          env
+          df -h
+          #sudo apt install -y xvfb
+          #xvfb-run ls
+          # docker-compose 1.x speaks Docker API 1.22, which current Docker rejects; use the Compose v2 plugin.
+          printf '#!/bin/sh\nexec docker compose "$@"\n' | sudo tee /usr/local/bin/docker-compose >/dev/null
+          sudo chmod +x /usr/local/bin/docker-compose
+          docker-compose version
+          IP=`hostname -I | awk '{print $1}'`
+          echo '{"insecure-registries" : ["'$IP':5000"]}' | sudo tee /etc/docker/daemon.json
+          echo "IP=$IP" >> $GITHUB_ENV
+          sudo cp ./tests/harbor_ca.crt /usr/local/share/ca-certificates/
+          sudo update-ca-certificates
+          sudo service docker restart
+      - name: script
+        run: |
+          echo IP: $IP
+          df -h
+          cd src/github.com/goharbor/harbor
+          # Photon 4.0 aarch64 packages stopped updating in 2025, so arm64 images use photon:5.0.
+          sudo make compile build GOBUILDTAGS="include_oss include_gcs" VERSIONTAG=dev-gitaction \
+            GOBUILDIMAGE=golang:1.27.3 COMPILETAG=compile_golangimage PHOTON_IMAGE=photon:5.0 LINT_APIS=false \
+            CHARTFLAG=true TRIVYFLAG=true NOTARYFLAG=false PULL_BASE_FROM_DOCKERHUB=false \
+            BUILDTARGET="_build_portal _build_core _build_jobservice _build_registry _build_registryctl _build_chart_server _build_trivy_adapter _build_nginx _compile_and_build_exporter"
+          df -h
+      - name: smoke test images
+        run: |
+          cd src/github.com/goharbor/harbor
+          bash ./tests/ci/smoke_images.sh dev-gitaction
+      - name: save images
+        run: |
+          set -e
+          mkdir -p "$RUNNER_TEMP/images"
+          images=""
+          for name in nginx-photon harbor-portal harbor-core harbor-jobservice registry-photon harbor-registryctl chartmuseum-photon trivy-adapter-photon harbor-exporter; do
+            images="$images goharbor/$name:dev-gitaction"
+          done
+          docker image inspect --format '{{index .RepoTags 0}} {{.Id}} {{.Architecture}}' $images | tee "$RUNNER_TEMP/images/images.txt"
+          docker save $images | gzip -1 > "$RUNNER_TEMP/images/harbor-images-arm64.tar.gz"
+          ls -lh "$RUNNER_TEMP/images"
+      - name: scan images
+        run: |
+          set -e
+          for name in nginx-photon harbor-portal harbor-core harbor-jobservice registry-photon harbor-registryctl chartmuseum-photon trivy-adapter-photon harbor-exporter; do
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$RUNNER_TEMP/images:/out" aquasec/trivy:0.76.2 \
+              image --quiet --scanners vuln --severity CRITICAL,HIGH --format json -o /out/trivy-$name.json goharbor/$name:dev-gitaction
+            python3 -c 'import json,sys
+          d=json.load(open(sys.argv[1]));c=h=0
+          for t in d.get("Results") or []:
+              for v in t.get("Vulnerabilities") or []:
+                  c+=v["Severity"]=="CRITICAL";h+=v["Severity"]=="HIGH"
+          print(sys.argv[2],"critical",c,"high",h)' "$RUNNER_TEMP/images/trivy-$name.json" $name | tee -a "$RUNNER_TEMP/images/scan-summary.txt"
+          done
+      - name: upload images
+        uses: actions/upload-artifact@v4
+        with:
+          name: harbor-images-arm64
+          path: ${{ runner.temp }}/images
+          retention-days: 7
+          compression-level: 0
+
+  PUBLISH:
+    # Runs only for a pushed tag, after every test job passed. The amd64 and arm64 images are built
+    # natively by OFFLINE and OFFLINE_ARM64; this pushes them per arch and joins them into one tag.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [UTTEST, APITEST_DB, APITEST_LDAP, OFFLINE, OFFLINE_ARM64]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      REPO: ghcr.io/daocloud/harbor-lts
+      IMAGES: nginx-photon harbor-portal harbor-core harbor-jobservice registry-photon harbor-registryctl chartmuseum-photon trivy-adapter-photon harbor-exporter
+    steps:
+      - name: free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af >/dev/null
+          df -h /
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: harbor-images-*
+          path: ${{ runner.temp }}/images
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: push per-arch images
+        run: |
+          set -e
+          TAG=$GITHUB_REF_NAME
+          for arch in amd64 arm64; do
+            # Both archives tag their images goharbor/<name>:dev-gitaction, so handle one arch at a time.
+            gunzip -c "$RUNNER_TEMP/images/harbor-images-$arch/harbor-images-$arch.tar.gz" | docker load
+            for name in $IMAGES; do
+              got=$(docker image inspect --format '{{.Architecture}}' goharbor/$name:dev-gitaction)
+              [ "$got" = "$arch" ] || { echo "goharbor/$name is $got, expected $arch"; exit 1; }
+              docker tag goharbor/$name:dev-gitaction $REPO/$name:$TAG-$arch
+              docker push -q $REPO/$name:$TAG-$arch
+            done
+            docker image rm $(for name in $IMAGES; do echo goharbor/$name:dev-gitaction $REPO/$name:$TAG-$arch; done) >/dev/null
+          done
+      - name: join architectures
+        run: |
+          set -e
+          TAG=$GITHUB_REF_NAME
+          for name in $IMAGES; do
+            docker buildx imagetools create -t $REPO/$name:$TAG $REPO/$name:$TAG-amd64 $REPO/$name:$TAG-arm64
+            docker buildx imagetools inspect --raw $REPO/$name:$TAG \
+              | python3 -c 'import json,sys; m=json.load(sys.stdin); a=sorted(x["platform"]["architecture"] for x in m["manifests"]); print(sys.argv[1], a); sys.exit(a != ["amd64", "arm64"])' $name
+          done

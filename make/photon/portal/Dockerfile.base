@@ -1,6 +1,9 @@
-FROM photon:4.0
+# photon:5.0 for arm64, whose Photon 4.0 update repository is no longer published
+ARG photon_image=photon:4.0
+FROM ${photon_image}
 
-RUN tdnf install -y nginx shadow >> /dev/null \
+RUN tdnf -y upgrade >> /dev/null \
+    && tdnf install -y nginx shadow curl ca-certificates >> /dev/null \
     && tdnf clean all \
     && ln -sf /dev/stdout /var/log/nginx/access.log \
     && ln -sf /dev/stderr /var/log/nginx/error.log \

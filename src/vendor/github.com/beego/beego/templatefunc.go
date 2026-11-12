@@ -473,11 +473,11 @@ func RenderForm(obj interface{}) template.HTML {
 // renderFormField returns a string containing HTML of a single form field.
 func renderFormField(label, name, fType string, value interface{}, id string, class string, required bool) string {
 	if id != "" {
-		id = " id=\"" + id + "\""
+		id = " id=\"" + template.HTMLEscapeString(id) + "\""
 	}
 
 	if class != "" {
-		class = " class=\"" + class + "\""
+		class = " class=\"" + template.HTMLEscapeString(class) + "\""
 	}
 
 	requiredString := ""
@@ -485,11 +485,18 @@ func renderFormField(label, name, fType string, value interface{}, id string, cl
 		requiredString = " required"
 	}
 
-	if isValidForInput(fType) {
-		return fmt.Sprintf(`%v<input%v%v name="%v" type="%v" value="%v"%v>`, label, id, class, name, fType, value, requiredString)
+	// Escape user-controlled values, backported from the CVE-2025-30223 fix in beego v2.3.6.
+	validInput := isValidForInput(fType)
+	label = template.HTMLEscapeString(label)
+	name = template.HTMLEscapeString(name)
+	fType = template.HTMLEscapeString(fType)
+	escapedValue := template.HTMLEscapeString(fmt.Sprintf("%v", value))
+
+	if validInput {
+		return fmt.Sprintf(`%v<input%v%v name="%v" type="%v" value="%v"%v>`, label, id, class, name, fType, escapedValue, requiredString)
 	}
 
-	return fmt.Sprintf(`%v<%v%v%v name="%v"%v>%v</%v>`, label, fType, id, class, name, requiredString, value, fType)
+	return fmt.Sprintf(`%v<%v%v%v name="%v"%v>%v</%v>`, label, fType, id, class, name, requiredString, escapedValue, fType)
 }
 
 // isValidForInput checks if fType is a valid value for the `type` property of an HTML input element.

@@ -32,5 +32,6 @@ for p in $(ls /go/bin/*.patch); do
 done
 
 #Compile
-cd $SRC_PATH/$MAIN_GO_PATH && go build -a -o $BIN_NAME
+# Static binary: the Go build image's glibc is newer than the one in photon:4.0.
+cd $SRC_PATH/$MAIN_GO_PATH && CGO_ENABLED=0 go build -a -o $BIN_NAME
 mv $BIN_NAME /go/bin/

@@ -17,9 +17,9 @@ cur=$PWD
 # The temporary directory to clone Trivy adapter source code
 TEMP=$(mktemp -d ${TMPDIR-/tmp}/trivy-adapter.XXXXXX)
 git clone https://github.com/aquasecurity/harbor-scanner-trivy.git $TEMP
-cd $TEMP; git checkout $VERSION; cd -
+cd $TEMP; git checkout $VERSION; git apply $cur/harbor-scanner-trivy-dce.patch; cd -
 
-echo "Building Trivy adapter binary based on golang:1.18.8..."
+echo "Building Trivy adapter binary based on golang:1.27.3..."
 cp Dockerfile.binary $TEMP
 docker build -f $TEMP/Dockerfile.binary -t trivy-adapter-golang $TEMP
 

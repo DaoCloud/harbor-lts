@@ -1,6 +1,9 @@
-FROM photon:4.0
+# photon:5.0 for arm64, whose Photon 4.0 update repository is no longer published
+ARG photon_image=photon:4.0
+FROM ${photon_image}
 
-RUN tdnf install -y shadow >>/dev/null\
+RUN tdnf -y upgrade >> /dev/null \
+    && tdnf install -y shadow curl ca-certificates >> /dev/null\
     && tdnf clean all \
     && groupadd -r -g 10000 chart \
     && useradd --no-log-init -m -g 10000 -u 10000 chart
