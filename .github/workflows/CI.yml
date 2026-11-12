@@ -21,6 +21,9 @@ on:
     # PR branches run through pull_request only, so each push runs CI once.
     branches:
     - release-*
+    # A pushed tag (e.g. v2.6.3-2) is a release: PUBLISH pushes its images to ghcr.
+    tags:
+    - 'v*'
     paths-ignore:
     - 'docs/**'
 
@@ -449,3 +452,55 @@ jobs:
           path: ${{ runner.temp }}/images
           retention-days: 7
           compression-level: 0
+
+  PUBLISH:
+    # Runs only for a pushed tag, after every test job passed. The amd64 and arm64 images are built
+    # natively by OFFLINE and OFFLINE_ARM64; this pushes them per arch and joins them into one tag.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [UTTEST, APITEST_DB, APITEST_LDAP, OFFLINE, OFFLINE_ARM64]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      REPO: ghcr.io/daocloud/harbor-lts
+      IMAGES: nginx-photon harbor-portal harbor-core harbor-jobservice registry-photon harbor-registryctl chartmuseum-photon trivy-adapter-photon harbor-exporter
+    steps:
+      - name: free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af >/dev/null
+          df -h /
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: harbor-images-*
+          path: ${{ runner.temp }}/images
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: push per-arch images
+        run: |
+          set -e
+          TAG=$GITHUB_REF_NAME
+          for arch in amd64 arm64; do
+            # Both archives tag their images goharbor/<name>:dev-gitaction, so handle one arch at a time.
+            gunzip -c "$RUNNER_TEMP/images/harbor-images-$arch/harbor-images-$arch.tar.gz" | docker load
+            for name in $IMAGES; do
+              got=$(docker image inspect --format '{{.Architecture}}' goharbor/$name:dev-gitaction)
+              [ "$got" = "$arch" ] || { echo "goharbor/$name is $got, expected $arch"; exit 1; }
+              docker tag goharbor/$name:dev-gitaction $REPO/$name:$TAG-$arch
+              docker push -q $REPO/$name:$TAG-$arch
+            done
+            docker image rm $(for name in $IMAGES; do echo goharbor/$name:dev-gitaction $REPO/$name:$TAG-$arch; done) >/dev/null
+          done
+      - name: join architectures
+        run: |
+          set -e
+          TAG=$GITHUB_REF_NAME
+          for name in $IMAGES; do
+            docker buildx imagetools create -t $REPO/$name:$TAG $REPO/$name:$TAG-amd64 $REPO/$name:$TAG-arm64
+            docker buildx imagetools inspect --raw $REPO/$name:$TAG \
+              | python3 -c 'import json,sys; m=json.load(sys.stdin); a=sorted(x["platform"]["architecture"] for x in m["manifests"]); print(sys.argv[1], a); sys.exit(a != ["amd64", "arm64"])' $name
+          done
