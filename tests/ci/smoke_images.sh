@@ -21,4 +21,19 @@ check trivy-adapter-photon /usr/local/bin/trivy --version
 check harbor-exporter /harbor/harbor_exporter
 check nginx-photon nginx -v
 check harbor-portal nginx -v
+# NGINX2Root is fixed in nginx 1.30.7. Check the binary and the rpm database that scanners read,
+# as scanners do not know about NGINX2Root yet. The images have no rpm command, so ask tdnf.
+NGINX_MIN=1.30.7
+check_nginx() {
+    if [[ $3 =~ ^[0-9]+(\.[0-9]+)+$ ]] && [ "$(printf '%s\n' $NGINX_MIN "$3" | sort -V | head -1)" = $NGINX_MIN ]; then
+        echo "ok   $1 $2: $3"
+    else
+        echo "FAIL $1 $2: '$3' is not nginx $NGINX_MIN or later"; rc=1
+    fi
+}
+for image in nginx-photon harbor-portal; do
+    check_nginx $image "nginx -v" "$(docker run --rm --entrypoint nginx goharbor/$image:$TAG -v 2>&1 | sed -n 's#^nginx version: nginx/##p')"
+    check_nginx $image "rpm database" "$(docker run --rm --user root --entrypoint tdnf goharbor/$image:$TAG --disablerepo='*' list installed nginx 2>&1 \
+        | sed -n 's/^nginx\.[^ ]* *\([0-9]*:\)\{0,1\}\([0-9][0-9.]*\)-.*/\2/p')"
+done
 exit $rc

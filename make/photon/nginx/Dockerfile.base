@@ -1,10 +1,21 @@
-# photon:5.0 for arm64, whose Photon 4.0 update repository is no longer published
-ARG photon_image=photon:4.0
-FROM ${photon_image}
+# photon:5.0 on every architecture: Photon 4.0 gets no nginx updates (x86_64 stays on 1.26)
+ARG photon_image=photon:5.0
 
-RUN tdnf -y upgrade >> /dev/null \
+# nginx 1.30.7 (NGINX2Root fixes) is not in Photon 5.0 yet; the script explains how to drop this stage
+FROM ${photon_image} AS nginx-rpm
+COPY make/photon/common/nginx_rpm_builder.sh /
+RUN bash /nginx_rpm_builder.sh /nginx-rpms
+
+FROM ${photon_image}
+COPY --from=nginx-rpm /nginx-rpms /tmp/nginx-rpms
+
+# Install before upgrading: the x86_64 photon-repos 5.0-11.1 update disables every Photon repository
+RUN printf '[nginx-local]\nname=nginx-local\nbaseurl=file:///tmp/nginx-rpms\ngpgcheck=0\nenabled=1\n' > /etc/yum.repos.d/nginx-local.repo \
     && tdnf install -y nginx shadow curl ca-certificates >> /dev/null \
+    && tdnf -y upgrade >> /dev/null \
+    && tdnf list installed nginx \
     && tdnf clean all \
+    && rm -rf /etc/yum.repos.d/nginx-local.repo /tmp/nginx-rpms \
     && groupmod -g 10000 nginx && usermod -g 10000 -u 10000 -d /home/nginx -s /bin/bash nginx \
     && ln -sf /dev/stdout /var/log/nginx/access.log \
     && ln -sf /dev/stderr /var/log/nginx/error.log
