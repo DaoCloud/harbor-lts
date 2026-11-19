@@ -25,6 +25,8 @@ DOCKERIMAGES=$(DOCKERCMD) images
 IMAGENAMESPACE=goharbor
 BASEIMAGENAMESPACE=goharbor
 PHOTON_IMAGE=photon:4.0
+# nginx and portal use Photon 5.0 on every architecture, as Photon 4.0 gets no nginx updates
+NGINX_PHOTON_IMAGE=photon:5.0
 
 # pushimage
 PUSHSCRIPTPATH=$(MAKEPATH)
@@ -139,7 +141,7 @@ _build_db:
 	@echo "Done."
 
 _build_portal:
-	@$(call _build_base,$(PORTAL),$(DOCKERFILEPATH_PORTAL))
+	@$(call _build_base,$(PORTAL),$(DOCKERFILEPATH_PORTAL),$(NGINX_PHOTON_IMAGE))
 	@echo "building portal container for photon..."
 	$(DOCKERBUILD_WITH_PULL_PARA) --build-arg harbor_base_image_version=$(BASEIMAGETAG) --build-arg harbor_base_namespace=$(BASEIMAGENAMESPACE) --build-arg npm_registry=$(NPM_REGISTRY) -f $(DOCKERFILEPATH_PORTAL)/$(DOCKERFILENAME_PORTAL) -t $(DOCKERIMAGENAME_PORTAL):$(VERSIONTAG) .
 	@echo "Done."
@@ -201,7 +203,7 @@ _build_chart_server:
 	fi
 
 _build_nginx:
-	@$(call _build_base,$(NGINX),$(DOCKERFILEPATH_NGINX))
+	@$(call _build_base,$(NGINX),$(DOCKERFILEPATH_NGINX),$(NGINX_PHOTON_IMAGE))
 	@echo "building nginx container for photon..."
 	@$(DOCKERBUILD_WITH_PULL_PARA) --build-arg harbor_base_image_version=$(BASEIMAGETAG) --build-arg harbor_base_namespace=$(BASEIMAGENAMESPACE) -f $(DOCKERFILEPATH_NGINX)/$(DOCKERFILENAME_NGINX) -t $(DOCKERIMAGENAME_NGINX):$(VERSIONTAG) .
 	@echo "Done."
@@ -270,6 +272,7 @@ define _get_binary
 	$(CURL) --connect-timeout 30 -f -k -L $1 -o $2 || exit 1
 endef
 
+# $(3): optional photon image, defaults to $(PHOTON_IMAGE)
 define _build_base
 	if [ "$(BUILD_BASE)" = "true" ] ; then \
 		echo "building base image for $(1)...";\
@@ -283,7 +286,7 @@ define _build_base
 			cd $(DOCKERFILEPATH)/db && $(DOCKERFILEPATH)/db/rpm_builder.sh && cd - ; \
 			$(DOCKERBUILD) --pull --no-cache -f $(DOCKERFILEPATH)/db/Dockerfile.pg96 -t $(BASEIMAGENAMESPACE)/harbor-db-base:$(BASEIMAGETAG) --label base-build-date=$(TIMESTAMP) . ; \
 		else \
-			$(DOCKERBUILD) --build-arg photon_image=$(PHOTON_IMAGE) -f $(2)/Dockerfile.base -t $(BASEIMAGENAMESPACE)/harbor-$(1)-base:$(BASEIMAGETAG) --label base-build-date=$(TIMESTAMP) . ;\
+			$(DOCKERBUILD) --build-arg photon_image=$(or $(3),$(PHOTON_IMAGE)) -f $(2)/Dockerfile.base -t $(BASEIMAGENAMESPACE)/harbor-$(1)-base:$(BASEIMAGETAG) --label base-build-date=$(TIMESTAMP) . ;\
 		fi ;\
 		if [ "$(PUSHBASEIMAGE)" = "true" ] ; then \
 			$(PUSHSCRIPTPATH)/$(PUSHSCRIPTNAME) $(BASEIMAGENAMESPACE)/harbor-$(1)-base:$(BASEIMAGETAG) $(REGISTRYUSER) $(REGISTRYPASSWORD) docker.io $(PULL_BASE_FROM_DOCKERHUB) || exit 1; \
