@@ -1,0 +1,67 @@
+name: Sync release images
+# Copies images that CI published to ghcr.io/daocloud/harbor-lts to release.daocloud.io/goharbor without
+# changing their digests: <image>:<tag> (amd64 and arm64), <image>:<tag>-amd64 and <image>:<tag>-arm64.
+# Needs the RELEASE_REGISTRY_USERNAME and RELEASE_REGISTRY_PASSWORD secrets: a release.daocloud.io robot
+# account that can push to the goharbor project.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag on ghcr.io/daocloud/harbor-lts, e.g. v2.6.3-1
+        required: true
+        type: string
+      images:
+        description: Images to copy, separated by spaces
+        required: true
+        type: string
+        default: nginx-photon harbor-portal harbor-core harbor-jobservice registry-photon harbor-registryctl chartmuseum-photon trivy-adapter-photon harbor-exporter
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  SYNC:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      SRC: ghcr.io/daocloud/harbor-lts
+      DST: release.daocloud.io/goharbor
+      TAG: ${{ inputs.tag }}
+      IMAGES: ${{ inputs.images }}
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/login-action@v3
+        with:
+          registry: release.daocloud.io
+          username: ${{ secrets.RELEASE_REGISTRY_USERNAME }}
+          password: ${{ secrets.RELEASE_REGISTRY_PASSWORD }}
+      - name: copy images
+        run: |
+          set -euo pipefail
+          [[ $TAG =~ ^v[0-9A-Za-z._-]+$ ]] || { echo "invalid tag: $TAG"; exit 1; }
+          read -ra images <<< "$IMAGES"
+          [ ${#images[@]} -gt 0 ] || { echo "no images given"; exit 1; }
+          command -v skopeo > /dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq skopeo; }
+          skopeo --version
+          digest() { skopeo inspect --raw "docker://$1" | sha256sum | cut -d' ' -f1; }
+          { echo "| image | digest |"; echo "|---|---|"; } >> "$GITHUB_STEP_SUMMARY"
+          for name in "${images[@]}"; do
+            [[ $name =~ ^[a-z0-9-]+$ ]] || { echo "invalid image: $name"; exit 1; }
+            # --all copies both architectures of the index; --preserve-digests fails instead of changing a digest.
+            skopeo copy --all --preserve-digests --retry-times 3 "docker://$SRC/$name:$TAG" "docker://$DST/$name:$TAG"
+            for t in "$TAG-amd64" "$TAG-arm64"; do
+              skopeo copy --preserve-digests --retry-times 3 "docker://$SRC/$name:$t" "docker://$DST/$name:$t"
+            done
+            for t in "$TAG" "$TAG-amd64" "$TAG-arm64"; do
+              src=$(digest "$SRC/$name:$t")
+              dst=$(digest "$DST/$name:$t")
+              [ "$src" = "$dst" ] || { echo "$DST/$name:$t is sha256:$dst, but $SRC/$name:$t is sha256:$src"; exit 1; }
+              echo "$DST/$name:$t sha256:$dst"
+              echo "| $DST/$name:$t | sha256:$dst |" >> "$GITHUB_STEP_SUMMARY"
+            done
+          done
